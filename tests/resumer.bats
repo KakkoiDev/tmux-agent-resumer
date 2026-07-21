@@ -183,6 +183,95 @@ teardown() {
     [ "$output" = "gaveup" ]
 }
 
+@test "credit-guard: interrupts on fresh crossing into session-max" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on ALLOW_CREDITS=off CREDIT_THRESHOLD=100 NTFY_TOPIC="" CAFFEINATE=off
+    export USAGE_JSON="$TMPD/u.json"
+    printf '%s' '{"five_hour":{"utilization":100,"resets_at":"2030-01-01T00:00:00Z"},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
+    export TRACKER_DB="$TMPD/tracker.db"
+    sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_target TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg1','s:1.9','%9','','claude','working');"
+    printf '50' > "$RESUMER_DIR/.session_util"      # prev below threshold -> crossing
+    SENT="$TMPD/sent"; : > "$SENT"
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    cmd_credit_guard
+    grep -q "send-keys -t %9 Escape" "$SENT"
+    run sqlite3 "$DB" "SELECT limit_type||':'||status FROM limited WHERE session_id='cg1';"
+    [ "$output" = "credit-guard:waiting" ]
+}
+
+@test "credit-guard: no interrupt when already maxed (no crossing)" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on ALLOW_CREDITS=off CREDIT_THRESHOLD=100 NTFY_TOPIC="" CAFFEINATE=off
+    export USAGE_JSON="$TMPD/u.json"
+    printf '%s' '{"five_hour":{"utilization":100},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
+    export TRACKER_DB="$TMPD/tracker.db"
+    sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg2','%9','','claude','working');"
+    printf '100' > "$RESUMER_DIR/.session_util"     # already maxed -> NO crossing
+    SENT="$TMPD/sent"; : > "$SENT"
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    cmd_credit_guard
+    [ ! -s "$SENT" ]
+    run sqlite3 "$DB" "SELECT COUNT(*) FROM limited;"
+    [ "$output" = "0" ]
+}
+
+@test "credit-guard: only interrupts working agents, not idle ones" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on ALLOW_CREDITS=off CREDIT_THRESHOLD=100 NTFY_TOPIC="" CAFFEINATE=off INTERRUPT_ESCAPES=1
+    export USAGE_JSON="$TMPD/u.json"
+    printf '%s' '{"five_hour":{"utilization":100,"resets_at":"2030-01-01T00:00:00Z"},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
+    export TRACKER_DB="$TMPD/tracker.db"
+    sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_target TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT);
+        INSERT INTO sessions VALUES('work','s:1.1','%1','','claude','working'),('idle','s:1.2','%2','','claude','idle');"
+    printf '50' > "$RESUMER_DIR/.session_util"
+    SENT="$TMPD/sent"; : > "$SENT"
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    cmd_credit_guard
+    grep -q "%1 Escape" "$SENT"        # working -> interrupted
+    ! grep -q "%2" "$SENT"             # idle -> untouched
+    run sqlite3 "$DB" "SELECT session_id FROM limited;"
+    [ "$output" = "work" ]
+}
+
+@test "credit-guard: allow-credits ON disables the guard" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on ALLOW_CREDITS=on CREDIT_THRESHOLD=100
+    export USAGE_JSON="$TMPD/u.json"
+    printf '%s' '{"five_hour":{"utilization":100},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
+    export TRACKER_DB="$TMPD/tracker.db"
+    sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg3','%9','','claude','working');"
+    printf '50' > "$RESUMER_DIR/.session_util"
+    SENT="$TMPD/sent"; : > "$SENT"
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    cmd_credit_guard
+    [ ! -s "$SENT" ]
+    run sqlite3 "$DB" "SELECT COUNT(*) FROM limited;"
+    [ "$output" = "0" ]
+}
+
+@test "credit-guard: resumes when session resets below threshold" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on CREDIT_THRESHOLD=100 NTFY_TOPIC=""
+    export USAGE_JSON="$TMPD/u.json"
+    printf '%s' '{"five_hour":{"utilization":40}}' > "$USAGE_JSON"   # reset, below threshold
+    SENT="$TMPD/sent"; : > "$SENT"
+    tmux() {
+        case "$*" in
+            "list-panes -a -F #{pane_id}") echo "%9" ;;
+            *"-p #{pane_pid}"*) echo 4242 ;;
+            *pane_active*) echo 0 ;;
+            *send-keys*) printf '%s\n' "$*" >> "$SENT" ;;
+            *) : ;;
+        esac
+    }
+    _has_agent_child() { return 0; }
+    sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,resume_prompt,retry_count,backoff_secs,next_retry_at,status) VALUES ('cgr','%9','credit-guard','','resume',0,120,$(date +%s),'waiting');"
+    cmd_retry cgr
+    grep -q "send-keys -t %9 resume Enter" "$SENT"
+    run sqlite3 "$DB" "SELECT status FROM limited WHERE session_id='cgr';"
+    [ "$output" = "resumed" ]
+}
+
 @test "retry no-ops (no typing) when disabled" {
     bash "$SCRIPT" init >/dev/null
     sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,status) VALUES ('s','%1','usage','/tmp/x','waiting');"

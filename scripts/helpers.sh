@@ -60,6 +60,10 @@ WARN_CREDITS=""
 IDLE_GRACE=""
 CAFFEINATE=""
 NTFY_TOPIC=""
+ALLOW_CREDITS=""
+CREDIT_THRESHOLD=""
+INTERRUPT_ESCAPES=""
+CREDIT_NOTICE=""
 DEBUG_LOG=""
 
 load_config() {
@@ -97,6 +101,16 @@ load_config() {
     CAFFEINATE=$(get_tmux_option "@agent-resumer-caffeinate" "on")
     # ntfy.sh topic for phone push on limit-hit / resume / give-up. Empty = off.
     NTFY_TOPIC=$(get_tmux_option "@agent-resumer-ntfy-topic" "")
+    # Credit safety: off (default) = block paid usage-credit spend. When the session
+    # window crosses CREDIT_THRESHOLD%, interrupt agents so they don't spend, wait for
+    # reset, resume. on = allow credits (emergency company extra usage).
+    ALLOW_CREDITS=$(get_tmux_option "@agent-resumer-allow-credits" "off")
+    CREDIT_THRESHOLD=$(get_tmux_option "@agent-resumer-credit-threshold" "100")
+    # How many Escapes to send to interrupt a turn (1 = plain interrupt; >1 risks
+    # opening Claude's rewind menu - verify on a live pane before raising).
+    INTERRUPT_ESCAPES=$(get_tmux_option "@agent-resumer-interrupt-escapes" "1")
+    # Notice typed into the paused pane's input box (not submitted).
+    CREDIT_NOTICE=$(get_tmux_option "@agent-resumer-credit-notice" "[Credit usage disabled - enable in resumer options]")
     DEBUG_LOG=$(get_tmux_option "@agent-resumer-debug-log" "1")
 
     cat > "${cache}.tmp" <<EOF
@@ -116,6 +130,10 @@ WARN_CREDITS='$WARN_CREDITS'
 IDLE_GRACE='$IDLE_GRACE'
 CAFFEINATE='$CAFFEINATE'
 NTFY_TOPIC='$NTFY_TOPIC'
+ALLOW_CREDITS='$ALLOW_CREDITS'
+CREDIT_THRESHOLD='$CREDIT_THRESHOLD'
+INTERRUPT_ESCAPES='$INTERRUPT_ESCAPES'
+CREDIT_NOTICE='$CREDIT_NOTICE'
 DEBUG_LOG='$DEBUG_LOG'
 EOF
     mv -f "${cache}.tmp" "$cache"

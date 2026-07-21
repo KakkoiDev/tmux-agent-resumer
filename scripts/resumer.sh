@@ -277,11 +277,14 @@ cmd_retry() {
         return 0
     fi
     local info
-    info=$(sql "SELECT status||char(9)||COALESCE(tmux_pane,'')||char(9)||limit_type||char(9)||transcript_path||char(9)||retry_count||char(9)||backoff_secs||char(9)||COALESCE(resume_prompt,'resume')
+    # char(31) (unit separator, non-whitespace) so EMPTY fields survive the split -
+    # credit-guard rows have empty transcript_path; a tab/space IFS would collapse
+    # adjacent delimiters and shift every following field.
+    info=$(sql "SELECT status||char(31)||COALESCE(tmux_pane,'')||char(31)||limit_type||char(31)||transcript_path||char(31)||retry_count||char(31)||backoff_secs||char(31)||COALESCE(resume_prompt,'resume')
                FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
     [[ -z "$info" ]] && return 0
     local st pane type tp rc backoff rp
-    IFS=$'\t' read -r st pane type tp rc backoff rp <<< "$info"
+    IFS=$'\x1f' read -r st pane type tp rc backoff rp <<< "$info"
     [[ "$st" == "waiting" || "$st" == "retrying" ]] || { _debug_log "RETRY sid=$sid skip status=$st"; return 0; }
     local now; now=$(date +%s)
 
@@ -313,6 +316,21 @@ cmd_retry() {
             fi
             _debug_log "RETRY sid=$sid pane watched but client idle ${idle}s (>= ${grace}s) - resuming"
         fi
+    fi
+    # credit-guard rows resume on session RESET (utilization drop), not a 429 clear.
+    if [[ "$type" == "credit-guard" ]]; then
+        local su sui; su=$(_session_util); sui=${su%.*}
+        if [[ -n "$su" && "${sui:-100}" -lt "${CREDIT_THRESHOLD:-100}" ]]; then
+            tmux send-keys -t "$pane" C-u 2>/dev/null || true       # clear the typed notice
+            tmux send-keys -t "$pane" "$rp" Enter 2>/dev/null || true
+            sql "UPDATE limited SET status='resumed',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
+            _debug_log "credit-guard RESUME sid=$sid (session back to ${su}%)"
+            _notify "resumer: session reset - resumed agent (pane ${pane})."; return 0
+        fi
+        local nbg; nbg=$(_next_backoff "$backoff" usage)
+        sql "UPDATE limited SET status='waiting',retry_count=$((rc+1)),backoff_secs=$nbg,next_retry_at=$((now+nbg)),updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
+        _debug_log "credit-guard sid=$sid still maxed (${su:-?}%), wait ${nbg}s"
+        _schedule_retry "$sid" "$nbg"; return 0
     fi
     # Cleared already?
     if ! _detect_limit_line "$tp" >/dev/null; then
@@ -358,6 +376,82 @@ cmd_scan() {
          FROM sessions WHERE COALESCE(agent_type,'')='' AND COALESCE(agent_client,'claude')='claude';" 2>/dev/null)
 }
 
+# ── credit guard (block paid overage; "Allow usage credit" = the safety toggle) ──
+
+_num_field() {  # $1=usage.json $2=dotted path e.g. five_hour.utilization / spend.percent
+    python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+cur=d
+for k in sys.argv[2].split('.'):
+    cur=(cur or {}).get(k) if isinstance(cur,dict) else None
+try: print(float(cur))
+except Exception: pass
+PY
+}
+_session_util() { _num_field "$USAGE_JSON" "five_hour.utilization"; }
+_credits_pct()  { _num_field "$USAGE_JSON" "spend.percent"; }
+
+# Interrupt only WORKING claude agents (those mid-turn = actually spending
+# credits); idle/finished panes spend nothing and are left alone. Sends Escape
+# to stop the turn, types the notice into the box (no Enter), enqueues each for
+# a free resume at the session reset. Only reached on a fresh crossing into max.
+_credit_guard_interrupt() {
+    [[ -f "$TRACKER_DB" ]] || return 0
+    local reset_secs now delay sid target pane st n=0 esc="${INTERRUPT_ESCAPES:-1}" i
+    reset_secs=$(_seconds_until_session_reset 2>/dev/null || echo 0)
+    now=$(date +%s)
+    delay=$(( ${reset_secs:-0} + 15 )); [[ "$delay" -lt 60 ]] && delay=300
+    while IFS='|' read -r sid target pane; do
+        [[ -z "$sid" || -z "$pane" ]] && continue
+        st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
+        [[ "$st" == "waiting" || "$st" == "retrying" ]] && continue   # already handled
+        i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
+        [[ -n "${CREDIT_NOTICE:-}" ]] && tmux send-keys -t "$pane" "$CREDIT_NOTICE" 2>/dev/null || true  # typed, NOT submitted
+        sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
+             INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
+                 resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)
+             VALUES ('$(sql_esc "$sid")','$(sql_esc "$pane")','$(sql_esc "$target")','credit-guard','',
+                 'resume',0,$delay,$((now+delay)),'waiting',$now,$now);"
+        _schedule_retry "$sid" "$delay"
+        n=$((n+1))
+    done < <(sqlite3 -separator '|' "$TRACKER_DB" \
+        "SELECT session_id, COALESCE(tmux_target,''), COALESCE(tmux_pane,'')
+         FROM sessions WHERE COALESCE(agent_type,'')='' AND COALESCE(agent_client,'claude')='claude'
+           AND status='working';" 2>/dev/null)
+    _debug_log "credit-guard: interrupted $n working agent(s) at session-max; resume in ${delay}s"
+    [[ "$n" -gt 0 ]] && _notify "resumer: session maxed - blocked credit spend on $n agent(s). Free resume at reset."
+    _caffeinate_sync
+}
+
+# Detect a fresh crossing into session-max and, unless credits are allowed,
+# interrupt to avoid paid spend. Crossing-only (tracks last util) so it never
+# nukes an already-maxed session the instant it's armed.
+cmd_credit_guard() {
+    _load_config_fast
+    [[ "${ENABLED:-off}" == "on" ]] || return 0
+    [[ -f "$USAGE_JSON" ]] || return 0
+    local thr cur curi sf prev previ
+    thr="${CREDIT_THRESHOLD:-100}"
+    cur=$(_session_util); [[ -z "$cur" ]] && return 0
+    sf="$RESUMER_DIR/.session_util"; prev=0
+    [[ -f "$sf" ]] && prev=$(cat "$sf" 2>/dev/null || echo 0)
+    printf '%s' "$cur" > "$sf"
+    curi=${cur%.*}; previ=${prev%.*}
+    # Allowing credits? then no guard (but still tracked util above).
+    [[ "${ALLOW_CREDITS:-off}" == "on" ]] && return 0
+    if [[ "${curi:-0}" -ge "$thr" && "${previ:-0}" -lt "$thr" ]]; then
+        local cp cpi; cp=$(_credits_pct); cpi=${cp%.*}
+        if [[ "${cpi:-0}" -ge 100 ]]; then
+            _debug_log "credit-guard: session maxed, credits exhausted - nothing to block"
+            _notify "resumer: session maxed and \$0 credits left - just wait for reset."
+            return 0
+        fi
+        _credit_guard_interrupt
+    fi
+}
+
 # ── status bar render ─────────────────────────────────────────────────
 
 # $1 = optional SPILL warning text (e.g. "SPILL S91 C82") rendered in red.
@@ -377,6 +471,12 @@ _write_cache() {
         final="#[fg=${COLOR:-yellow}]${waiting}${ICON_WAITING:-~}"
         [[ "$gaveup" -gt 0 ]] && final+=" ${gaveup}${ICON_GAVEUP:-x}"
         final+="#[default]"
+    fi
+    # Credit-guard blocked count (agents paused to avoid paid spend).
+    local cg
+    cg=$(sql "SELECT COUNT(*) FROM limited WHERE status IN ('waiting','retrying') AND limit_type='credit-guard';" 2>/dev/null || echo 0)
+    if [[ "${cg:-0}" -gt 0 ]]; then
+        final="#[fg=white,bg=red,bold] CREDIT BLOCKED ${cg} #[default]${final:+ $final}"
     fi
     if [[ -n "$warn" ]]; then
         [[ -n "$final" ]] && final+=" "
@@ -461,6 +561,7 @@ cmd_refresh() {
         if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]]; then
             touch "$stamp"; cmd_scan 2>/dev/null || true
         fi
+        cmd_credit_guard 2>/dev/null || true
         _caffeinate_sync 2>/dev/null || true
     fi
     _write_cache "$warn" 2>/dev/null || true
@@ -650,6 +751,7 @@ cmd_toggle() {
     case "$name" in
         enabled)       opt="@agent-resumer-enabled"; def="off" ;;
         caffeinate)    opt="@agent-resumer-caffeinate"; def="on" ;;
+        allow-credits) opt="@agent-resumer-allow-credits"; def="off" ;;
         *) return 1 ;;
     esac
     cur=$(get_tmux_option "$opt" "$def")
@@ -661,13 +763,16 @@ cmd_toggle() {
 # Options submenu: checkbox toggles, reopens itself after each flip. Modeled on
 # tmux-worktree's display-menu.
 cmd_options() {
-    local en caf ntfy
+    local en caf ntfy allow
     en=$(get_tmux_option "@agent-resumer-enabled" "off")
     caf=$(get_tmux_option "@agent-resumer-caffeinate" "on")
     ntfy=$(get_tmux_option "@agent-resumer-ntfy-topic" "")
+    allow=$(get_tmux_option "@agent-resumer-allow-credits" "off")
     box() { [[ "$1" == "on" ]] && printf '[x]' || printf '[ ]'; }
     local self="run-shell '$SCRIPTS_DIR/resumer.sh options'"
     local args=(-T "Resumer Options")
+    # The safety toggle: OFF (default) = paid credits blocked at session-max.
+    args+=("$(box "$allow") Allow usage credits (PAID)" "a" "run-shell '$SCRIPTS_DIR/resumer.sh toggle allow-credits' ; $self")
     args+=("$(box "$en") auto-resume"          "e" "run-shell '$SCRIPTS_DIR/resumer.sh toggle enabled' ; $self")
     args+=("$(box "$caf") caffeinate-while-paused" "c" "run-shell '$SCRIPTS_DIR/resumer.sh toggle caffeinate' ; $self")
     args+=("$(box "$([[ -n "$ntfy" ]] && echo on)") ntfy push: ${ntfy:-off}" "" "")
@@ -705,6 +810,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         usage)       cmd_usage_fetch >/dev/null && _usage_lines "$USAGE_JSON" ;;
         goto)        cmd_goto "${2:-}" ;;
         scan)        cmd_scan ;;
+        credit-guard) cmd_credit_guard ;;
         options)     cmd_options ;;
         toggle)      cmd_toggle "${2:-}" ;;
         *) echo "Usage: resumer.sh {init|hook <event>|detect-file <path>|retry <sid>|status-bar|refresh|cleanup|menu|usage|goto <target>|scan|options|toggle <name>}" >&2
