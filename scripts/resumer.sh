@@ -632,6 +632,7 @@ cmd_menu() {
     [[ "$found" -eq 0 ]] && args+=("No paused agents" "" "")
 
     args+=("" "" "")
+    args+=("Options >" "o" "run-shell '$SCRIPTS_DIR/resumer.sh options'")
     args+=("Refresh" "r" "run-shell '$SCRIPTS_DIR/resumer.sh menu'")
     args+=("Quit" "q" "")
 
@@ -640,6 +641,40 @@ cmd_menu() {
         printf '%s\n' "${args[@]}"
         return 0
     fi
+    tmux display-menu "${args[@]}"
+}
+
+# Flip a boolean tmux option on<->off and bust the config cache.
+cmd_toggle() {
+    local name="${1:?Usage: resumer.sh toggle <name>}" opt def cur
+    case "$name" in
+        enabled)       opt="@agent-resumer-enabled"; def="off" ;;
+        caffeinate)    opt="@agent-resumer-caffeinate"; def="on" ;;
+        *) return 1 ;;
+    esac
+    cur=$(get_tmux_option "$opt" "$def")
+    if [[ "$cur" == "on" ]]; then tmux set -g "$opt" "off"; else tmux set -g "$opt" "on"; fi
+    rm -f "$RESUMER_DIR/config_cache" 2>/dev/null || true
+    _debug_log "toggle $name -> $([[ "$cur" == on ]] && echo off || echo on)"
+}
+
+# Options submenu: checkbox toggles, reopens itself after each flip. Modeled on
+# tmux-worktree's display-menu.
+cmd_options() {
+    local en caf ntfy
+    en=$(get_tmux_option "@agent-resumer-enabled" "off")
+    caf=$(get_tmux_option "@agent-resumer-caffeinate" "on")
+    ntfy=$(get_tmux_option "@agent-resumer-ntfy-topic" "")
+    box() { [[ "$1" == "on" ]] && printf '[x]' || printf '[ ]'; }
+    local self="run-shell '$SCRIPTS_DIR/resumer.sh options'"
+    local args=(-T "Resumer Options")
+    args+=("$(box "$en") auto-resume"          "e" "run-shell '$SCRIPTS_DIR/resumer.sh toggle enabled' ; $self")
+    args+=("$(box "$caf") caffeinate-while-paused" "c" "run-shell '$SCRIPTS_DIR/resumer.sh toggle caffeinate' ; $self")
+    args+=("$(box "$([[ -n "$ntfy" ]] && echo on)") ntfy push: ${ntfy:-off}" "" "")
+    args+=("" "" "")
+    args+=("< Back to status"  "b" "run-shell '$SCRIPTS_DIR/resumer.sh menu'")
+    args+=("Quit" "q" "")
+    if [[ "${RESUMER_MENU_DRYRUN:-0}" == "1" ]]; then printf '%s\n' "${args[@]}"; return 0; fi
     tmux display-menu "${args[@]}"
 }
 
@@ -669,7 +704,10 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         menu)        cmd_menu ;;
         usage)       cmd_usage_fetch >/dev/null && _usage_lines "$USAGE_JSON" ;;
         goto)        cmd_goto "${2:-}" ;;
-        *) echo "Usage: resumer.sh {init|hook <event>|detect-file <path>|retry <sid>|status-bar|refresh|cleanup|menu|usage|goto <target>}" >&2
+        scan)        cmd_scan ;;
+        options)     cmd_options ;;
+        toggle)      cmd_toggle "${2:-}" ;;
+        *) echo "Usage: resumer.sh {init|hook <event>|detect-file <path>|retry <sid>|status-bar|refresh|cleanup|menu|usage|goto <target>|scan|options|toggle <name>}" >&2
            exit 1 ;;
     esac
 fi
