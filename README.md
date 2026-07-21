@@ -36,6 +36,11 @@ keyboard on that pane, but if the client has been idle past `@agent-resumer-idle
 (you walked away without switching panes) it resumes anyway; gives up if the pane/agent is
 gone or the retry cap is hit.
 
+While any agent is paused, resumer holds a `caffeinate -i` so the Mac doesn't idle-sleep
+and freeze the resume timer (Claude Code's own caffeinate lapses once the agent stalls). It
+releases when nothing is paused. Idle-sleep only - closing the lid still sleeps. Disable with
+`@agent-resumer-caffeinate off`.
+
 Enable it only after confirming it works for you (see gate below):
 ```
 tmux set -g @agent-resumer-enabled on
@@ -67,6 +72,7 @@ bats tests/resumer.bats
 `@agent-resumer-resume-prompt` (resume),
 `@agent-resumer-warn-session` (90), `@agent-resumer-warn-weekly` (90),
 `@agent-resumer-warn-credits` (80), `@agent-resumer-idle-grace` (60),
+`@agent-resumer-caffeinate` (on),
 `@agent-resumer-usage-backoff-floor` (120), `@agent-resumer-spend-backoff-floor` (1800),
 `@agent-resumer-backoff-cap` (3600), `@agent-resumer-usage-retry-cap` (12),
 `@agent-resumer-spend-retry-cap` (48), `@agent-resumer-debug-log` (1).

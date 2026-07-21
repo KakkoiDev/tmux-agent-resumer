@@ -26,7 +26,10 @@ setup() {
     printf '%s\n' "$NORMAL_LINE" > "$TMPD/clean.jsonl"
 }
 
-teardown() { rm -rf "$TMPD"; }
+teardown() {
+    [[ -f "$RESUMER_DIR/caffeinate.pid" ]] && kill "$(cat "$RESUMER_DIR/caffeinate.pid" 2>/dev/null)" 2>/dev/null
+    rm -rf "$TMPD"
+}
 
 @test "classify: spend cap message" {
     run _classify_limit "You've hit your org's monthly spend limit · run /usage-credits"
@@ -114,6 +117,28 @@ teardown() { rm -rf "$TMPD"; }
     printf '%s' '{"spend":{"enabled":false,"percent":99}}' > "$TMPD/nocredit.json"
     run _usage_warn "$TMPD/nocredit.json"
     [ -z "$output" ]
+}
+
+@test "caffeinate: off -> never spawns" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on CAFFEINATE=off
+    sqlite3 "$DB" "INSERT INTO limited (session_id,limit_type,transcript_path,status) VALUES ('s','usage','/tmp/x','waiting');"
+    _caffeinate_sync
+    [ ! -f "$RESUMER_DIR/caffeinate.pid" ]
+}
+
+@test "caffeinate: on -> holds while paused, releases when clear" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on CAFFEINATE=on
+    sqlite3 "$DB" "INSERT INTO limited (session_id,limit_type,transcript_path,status) VALUES ('s','usage','/tmp/x','waiting');"
+    _caffeinate_sync
+    [ -f "$RESUMER_DIR/caffeinate.pid" ]
+    local p; p=$(cat "$RESUMER_DIR/caffeinate.pid")
+    kill -0 "$p"                                   # alive while paused
+    sqlite3 "$DB" "UPDATE limited SET status='resumed';"
+    _caffeinate_sync
+    [ ! -f "$RESUMER_DIR/caffeinate.pid" ]          # released
+    run kill -0 "$p"; [ "$status" -ne 0 ]           # process gone
 }
 
 @test "retry no-ops (no typing) when disabled" {

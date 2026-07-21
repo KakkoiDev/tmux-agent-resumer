@@ -197,6 +197,31 @@ _schedule_retry() {
     tmux run-shell -b "sleep $delay && $SCRIPTS_DIR/resumer.sh retry $sid" 2>/dev/null || true
 }
 
+# Keep the Mac awake while any agent is paused, so the scheduled resume timer
+# survives idle sleep (Claude's own caffeinate lapses once the agent stalls).
+# Holds `caffeinate -i` while waiting/retrying rows exist, releases otherwise.
+# Self-expiring (-t) so a dead resumer can't pin the machine awake forever;
+# refresh (<=status-interval) relaunches it while still needed.
+_caffeinate_sync() {
+    _load_config_fast
+    [[ "${CAFFEINATE:-on}" == "on" ]] || return 0
+    local pidf="$RESUMER_DIR/caffeinate.pid" n running="" p
+    n=$(sql "SELECT COUNT(*) FROM limited WHERE status IN ('waiting','retrying');" 2>/dev/null || echo 0)
+    if [[ -f "$pidf" ]]; then
+        p=$(cat "$pidf" 2>/dev/null || true)
+        if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then running="$p"; else rm -f "$pidf"; fi
+    fi
+    if [[ "${n:-0}" -gt 0 && -z "$running" ]]; then
+        caffeinate -i -t 900 >/dev/null 2>&1 &
+        echo $! > "$pidf"
+        _debug_log "caffeinate on (pid $!) - $n paused agent(s)"
+    elif [[ "${n:-0}" -eq 0 && -n "$running" ]]; then
+        kill "$running" 2>/dev/null || true
+        rm -f "$pidf"
+        _debug_log "caffeinate off - no paused agents"
+    fi
+}
+
 # Record a limited session and schedule its first retry. No-op if already active.
 _enqueue_limited() {
     local sid="$1" target="$2" pane="$3" type="$4" tp="$5"
@@ -224,6 +249,7 @@ _enqueue_limited() {
              '$(sql_esc "$tp")','$(sql_esc "$rp")',0,$floor,$((now+delay)),'waiting',$now,$now);"
     _debug_log "enqueue sid=$sid type=$type pane=$pane first-retry=${delay}s"
     _schedule_retry "$sid" "$delay"
+    _caffeinate_sync
 }
 
 # One retry tick for a limited session. Sends the resume keys iff still limited,
@@ -384,6 +410,7 @@ cmd_refresh() {
         if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]]; then
             touch "$stamp"; cmd_scan 2>/dev/null || true
         fi
+        _caffeinate_sync 2>/dev/null || true
     fi
     _write_cache "$warn" 2>/dev/null || true
 }
