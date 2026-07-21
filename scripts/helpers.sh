@@ -57,6 +57,7 @@ RESUME_PROMPT=""
 WARN_SESSION=""
 WARN_WEEKLY=""
 WARN_CREDITS=""
+IDLE_GRACE=""
 DEBUG_LOG=""
 
 load_config() {
@@ -87,6 +88,8 @@ load_config() {
     WARN_SESSION=$(get_tmux_option "@agent-resumer-warn-session" "90")
     WARN_WEEKLY=$(get_tmux_option "@agent-resumer-warn-weekly" "90")
     WARN_CREDITS=$(get_tmux_option "@agent-resumer-warn-credits" "80")
+    # Resume a focused pane anyway if its client has been idle this long (walked away).
+    IDLE_GRACE=$(get_tmux_option "@agent-resumer-idle-grace" "60")
     DEBUG_LOG=$(get_tmux_option "@agent-resumer-debug-log" "1")
 
     cat > "${cache}.tmp" <<EOF
@@ -103,6 +106,7 @@ RESUME_PROMPT='$RESUME_PROMPT'
 WARN_SESSION='$WARN_SESSION'
 WARN_WEEKLY='$WARN_WEEKLY'
 WARN_CREDITS='$WARN_CREDITS'
+IDLE_GRACE='$IDLE_GRACE'
 DEBUG_LOG='$DEBUG_LOG'
 EOF
     mv -f "${cache}.tmp" "$cache"

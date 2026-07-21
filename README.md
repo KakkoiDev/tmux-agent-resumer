@@ -31,8 +31,10 @@ When an agent's turn dies on a 429, resumer types the resume prompt (default `re
 into that pane to re-issue the request. This does **not** bypass anything: the API still
 enforces the limit server-side; a retry while still limited just 429s again and backs off.
 For usage/rate limits the first retry is scheduled at the real reset time (from the usage
-endpoint); the spend cap uses a long bounded backoff. Guards: never types into a pane a
-client is actively viewing; gives up if the pane/agent is gone or the retry cap is hit.
+endpoint); the spend cap uses a long bounded backoff. Guards: won't type while you're at the
+keyboard on that pane, but if the client has been idle past `@agent-resumer-idle-grace`
+(you walked away without switching panes) it resumes anyway; gives up if the pane/agent is
+gone or the retry cap is hit.
 
 Enable it only after confirming it works for you (see gate below):
 ```
@@ -64,7 +66,7 @@ bats tests/resumer.bats
 `@agent-resumer-enabled` (off), `@agent-resumer-key` (R),
 `@agent-resumer-resume-prompt` (resume),
 `@agent-resumer-warn-session` (90), `@agent-resumer-warn-weekly` (90),
-`@agent-resumer-warn-credits` (80),
+`@agent-resumer-warn-credits` (80), `@agent-resumer-idle-grace` (60),
 `@agent-resumer-usage-backoff-floor` (120), `@agent-resumer-spend-backoff-floor` (1800),
 `@agent-resumer-backoff-cap` (3600), `@agent-resumer-usage-retry-cap` (12),
 `@agent-resumer-spend-retry-cap` (48), `@agent-resumer-debug-log` (1).

@@ -254,13 +254,25 @@ cmd_retry() {
         sql "UPDATE limited SET status='gaveup',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
         _debug_log "RETRY sid=$sid gaveup: no live agent in pane"; return 0
     fi
-    # Active-pane guard: never type into a pane a client is currently watching.
-    # Requires pane_active AND window_active AND an attached client on the session -
-    # a background agent pane in an unattached session is NOT "watched", so it resumes.
+    # Active-pane guard: don't type while you're actually at the keyboard on this
+    # pane. "Watched" = pane_active AND window_active AND a client attached to its
+    # session. But if that client has been idle past IDLE_GRACE (you walked away
+    # without switching panes), resume anyway - deferring forever defeats the point.
     local viewing; viewing=$(tmux display-message -t "$pane" -p '#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}' 2>/dev/null || echo 0)
     if [[ "$viewing" == "1" ]]; then
-        _debug_log "RETRY sid=$sid deferred: pane focused"
-        _schedule_retry "$sid" "$backoff"; return 0
+        local psess last_act idle grace
+        psess=$(tmux display-message -t "$pane" -p '#{session_name}' 2>/dev/null || true)
+        last_act=$(tmux list-clients -F '#{client_session} #{client_activity}' 2>/dev/null \
+            | awk -v s="$psess" '$1==s {print $2}' | sort -n | tail -1)
+        grace="${IDLE_GRACE:-60}"
+        if [[ -n "$last_act" ]]; then
+            idle=$(( now - last_act ))
+            if [[ "$idle" -lt "$grace" ]]; then
+                _debug_log "RETRY sid=$sid deferred: pane watched, client active ${idle}s ago (< ${grace}s)"
+                _schedule_retry "$sid" "$backoff"; return 0
+            fi
+            _debug_log "RETRY sid=$sid pane watched but client idle ${idle}s (>= ${grace}s) - resuming"
+        fi
     fi
     # Cleared already?
     if ! _detect_limit_line "$tp" >/dev/null; then
