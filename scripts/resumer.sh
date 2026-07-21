@@ -4,17 +4,20 @@ set -euo pipefail
 # tmux-agent-resumer - detect Claude Code agents that died on an API limit
 # (HTTP 429) and resume them via poll-and-retry with backoff.
 #
-# SCAFFOLD STATE (see ~/.claude/plans/we-have-a-harness-jiggly-pascal.md):
-#   IMPLEMENTED (safe, no pane side effects):
-#     - detect-file : pure analyzer, reads a transcript, prints NONE|spend|usage
-#     - hook        : OBSERVATIONAL ONLY - logs whether the hook fired and whether
-#                     a 429 was seen in the transcript. Writes no state, types nothing.
-#     - init/status-bar/refresh/cleanup plumbing + limited-table schema
-#   HELD until the reproduction gate is satisfied (do NOT enable blindly):
-#     - the limited-row state machine (insert/backoff/reschedule)
-#     - cmd_retry's `tmux send-keys` resume  (guarded by @agent-resumer-enabled, default off)
-#   Reproduction gate: confirm Stop/StopFailure actually fires on a 429 (check the
-#   debug log after a real limit hit) and observe the pane state before wiring resume.
+# STATE (see ~/.claude/plans/we-have-a-harness-jiggly-pascal.md):
+#   Always safe (no pane side effects):
+#     - detect-file : pure analyzer, prints NONE|spend|usage
+#     - hook        : logs whether the hook fired + whether a 429 was seen
+#     - usage/menu  : <prefix>+R modal (usage %, reset, weekly, credits) + paused list
+#     - refresh     : status badge, incl. SPILL alert when session/weekly/credits near cap (#2)
+#   #3 auto-resume (cmd_scan/cmd_retry/hook-enqueue) types "$RESUME_PROMPT" (default
+#   "resume") into the paused pane to re-issue the request once its window resets.
+#   It cannot bypass anything: the API still enforces the limit server-side; a retry
+#   while still limited just 429s again and backs off. For usage/rate limits the first
+#   retry is scheduled at the real reset time (from /api/oauth/usage). Gated behind
+#   @agent-resumer-enabled (default off) with an active-pane guard (won't type into the
+#   pane you're using) and a retry cap. UNVERIFIED until a real hit: that Stop/StopFailure
+#   fires on a 429, and that "resume"+Enter is what the post-429 TUI needs. Confirm, then enable.
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPTS_DIR/helpers.sh"
@@ -23,7 +26,8 @@ RESUMER_DIR="${RESUMER_DIR:-$HOME/.tmux-agent-resumer}"
 DB="${DB:-$RESUMER_DIR/resumer.db}"
 CACHE="${CACHE:-$RESUMER_DIR/status_cache}"
 USAGE_JSON="${USAGE_JSON:-$RESUMER_DIR/usage.json}"
-USAGE_TTL="${USAGE_TTL:-60}"          # seconds; reuse cached usage.json within this window
+USAGE_TTL="${USAGE_TTL:-300}"         # seconds; reuse cached usage.json within this window
+SCAN_INTERVAL="${SCAN_INTERVAL:-30}"  # seconds; min gap between background limit scans
 KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-Claude Code-credentials}"
 USAGE_URL="${USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
 TRACKER_DB="${TRACKER_DB:-$HOME/.tmux-agent-tracker/tracker.db}"
@@ -160,36 +164,152 @@ cmd_hook() {
     local line type
     if line=$(_detect_limit_line "$tp"); then
         type=$(_classify_limit "$(_json_val "$line" "text")")
-        _debug_log "HOOK $event sid=${sid:-?} DETECTED 429 type=$type pane=${TMUX_PANE:-none} (observational; resume held)"
+        _debug_log "HOOK $event sid=${sid:-?} DETECTED 429 type=$type pane=${TMUX_PANE:-none} enabled=${ENABLED:-off}"
+        if [[ "${ENABLED:-off}" == "on" && -n "${sid:-}" ]]; then
+            _enqueue_limited "$sid" "" "${TMUX_PANE:-}" "$type" "$tp"
+        fi
     else
         _debug_log "HOOK $event sid=${sid:-?} no 429 in transcript tail"
     fi
-    # HELD: limited-row insert + backoff schedule go here once the gate passes.
     return 0
 }
 
-# HELD: actual resume. Refuses until the reproduction gate is cleared AND the
-# user flips @agent-resumer-enabled on. No `tmux send-keys` ships in the scaffold.
+# ── resume state machine (#3) - gated behind @agent-resumer-enabled ───
+
+# Seconds until the 5-hour session window resets, from the cached usage JSON.
+# Lets a usage-limit resume be scheduled at the real reset instead of blind polling.
+_seconds_until_session_reset() {
+    [[ -f "$USAGE_JSON" ]] || return 1
+    python3 - "$USAGE_JSON" <<'PY' 2>/dev/null || true
+import json,sys,datetime
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+r=(d.get("five_hour") or {}).get("resets_at")
+if not r: sys.exit(0)
+try: t=datetime.datetime.fromisoformat(r.replace("Z","+00:00"))
+except Exception: sys.exit(0)
+print(max(int((t-datetime.datetime.now(datetime.timezone.utc)).total_seconds()),0))
+PY
+}
+
+_schedule_retry() {
+    local sid="$1" delay="$2"
+    tmux run-shell -b "sleep $delay && $SCRIPTS_DIR/resumer.sh retry $sid" 2>/dev/null || true
+}
+
+# Record a limited session and schedule its first retry. No-op if already active.
+_enqueue_limited() {
+    local sid="$1" target="$2" pane="$3" type="$4" tp="$5"
+    _load_config_fast
+    [[ -f "$DB" ]] || cmd_init >/dev/null 2>&1
+    local st
+    st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
+    [[ "$st" == "waiting" || "$st" == "retrying" ]] && return 0
+    [[ -z "$target" && -n "$pane" ]] && target=$(tmux display-message -t "$pane" \
+        -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
+
+    local floor="${USAGE_BACKOFF_FLOOR:-120}"
+    [[ "$type" == "spend" ]] && floor="${SPEND_BACKOFF_FLOOR:-1800}"
+    local delay="$floor"
+    if [[ "$type" == "usage" ]]; then
+        local rs; rs=$(_seconds_until_session_reset 2>/dev/null || true)
+        [[ -n "$rs" && "$rs" -gt 0 ]] 2>/dev/null && delay=$(( rs + 15 ))
+    fi
+    local now; now=$(date +%s)
+    local rp="${RESUME_PROMPT:-resume}"
+    sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
+         INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
+             resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)
+         VALUES ('$(sql_esc "$sid")','$(sql_esc "$pane")','$(sql_esc "$target")','$(sql_esc "$type")',
+             '$(sql_esc "$tp")','$(sql_esc "$rp")',0,$floor,$((now+delay)),'waiting',$now,$now);"
+    _debug_log "enqueue sid=$sid type=$type pane=$pane first-retry=${delay}s"
+    _schedule_retry "$sid" "$delay"
+}
+
+# One retry tick for a limited session. Sends the resume keys iff still limited,
+# pane alive, and not the pane the user is currently looking at.
 cmd_retry() {
     local sid="${1:?Usage: resumer.sh retry <session_id>}"
     _load_config_fast
+    [[ -f "$DB" ]] || return 0
     if [[ "${ENABLED:-off}" != "on" ]]; then
-        _debug_log "RETRY sid=$sid refused: @agent-resumer-enabled is off (repro gate)"
+        _debug_log "RETRY sid=$sid refused: @agent-resumer-enabled off"
         return 0
     fi
-    _debug_log "RETRY sid=$sid: resume path not implemented in scaffold (repro gate)"
-    # HELD implementation outline (do not enable before repro):
-    #   1. read limited row; bail if status != waiting.
-    #   2. guard: pane exists + _has_agent_child + pane is NOT the focused pane.
-    #   3. tmux send-keys -t <pane> "$RESUME_PROMPT" Enter ; status=retrying.
-    #   4. next hook re-detects; 429 -> _next_backoff + reschedule; clean -> resumed.
-    return 0
+    local info
+    info=$(sql "SELECT status||'\t'||COALESCE(tmux_pane,'')||'\t'||limit_type||'\t'||transcript_path||'\t'||retry_count||'\t'||backoff_secs||'\t'||COALESCE(resume_prompt,'resume')
+               FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
+    [[ -z "$info" ]] && return 0
+    local st pane type tp rc backoff rp
+    IFS=$'\t' read -r st pane type tp rc backoff rp <<< "$info"
+    [[ "$st" == "waiting" || "$st" == "retrying" ]] || { _debug_log "RETRY sid=$sid skip status=$st"; return 0; }
+    local now; now=$(date +%s)
+
+    if [[ -z "$pane" ]] || ! tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane"; then
+        sql "UPDATE limited SET status='gaveup',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
+        _debug_log "RETRY sid=$sid gaveup: pane '$pane' gone"; return 0
+    fi
+    local ppid; ppid=$(tmux display-message -t "$pane" -p '#{pane_pid}' 2>/dev/null || true)
+    if [[ -n "$ppid" ]] && ! _has_agent_child "$ppid"; then
+        sql "UPDATE limited SET status='gaveup',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
+        _debug_log "RETRY sid=$sid gaveup: no live agent in pane"; return 0
+    fi
+    # Active-pane guard: never type into a pane a client is currently watching.
+    # Requires pane_active AND window_active AND an attached client on the session -
+    # a background agent pane in an unattached session is NOT "watched", so it resumes.
+    local viewing; viewing=$(tmux display-message -t "$pane" -p '#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}' 2>/dev/null || echo 0)
+    if [[ "$viewing" == "1" ]]; then
+        _debug_log "RETRY sid=$sid deferred: pane focused"
+        _schedule_retry "$sid" "$backoff"; return 0
+    fi
+    # Cleared already?
+    if ! _detect_limit_line "$tp" >/dev/null; then
+        sql "UPDATE limited SET status='resumed',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
+        _debug_log "RETRY sid=$sid RESUMED (transcript no longer 429)"; return 0
+    fi
+    local cap="${USAGE_RETRY_CAP:-12}"; [[ "$type" == "spend" ]] && cap="${SPEND_RETRY_CAP:-48}"
+    if [[ "$rc" -ge "$cap" ]]; then
+        sql "UPDATE limited SET status='gaveup',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
+        _debug_log "RETRY sid=$sid gaveup: still limited after $cap attempts"; return 0
+    fi
+    # Type the resume prompt into the pane. This only RE-ISSUES the request; the
+    # API still enforces the limit - if the window is still closed it 429s again
+    # and we back off; once it has reset, the turn continues. No bypass, just the
+    # keypress you would make yourself.
+    tmux send-keys -t "$pane" "$rp" Enter 2>/dev/null || true
+    local nb; nb=$(_next_backoff "$backoff" "$type")
+    sql "UPDATE limited SET status='retrying',retry_count=$((rc+1)),backoff_secs=$nb,next_retry_at=$((now+nb)),updated_at=$now
+         WHERE session_id='$(sql_esc "$sid")';"
+    _debug_log "RETRY sid=$sid sent '$rp' attempt=$((rc+1)) next=${nb}s"
+    _schedule_retry "$sid" "$nb"
+}
+
+# Hook-independent trigger: scan tracked panes, enqueue any currently limited.
+cmd_scan() {
+    _load_config_fast
+    [[ "${ENABLED:-off}" == "on" ]] || return 0
+    [[ -f "$TRACKER_DB" ]] || return 0
+    [[ -f "$DB" ]] || cmd_init >/dev/null 2>&1
+    local sid target pane tp line type
+    while IFS='|' read -r sid target pane; do
+        [[ -z "$sid" ]] && continue
+        tp=$(_transcript_for "$sid")
+        [[ -z "$tp" ]] && continue
+        if line=$(_detect_limit_line "$tp"); then
+            type=$(_classify_limit "$(_json_val "$line" "text")")
+            _enqueue_limited "$sid" "$target" "$pane" "$type" "$tp"
+        fi
+    done < <(sqlite3 -separator '|' "$TRACKER_DB" \
+        "SELECT session_id, COALESCE(tmux_target,''), COALESCE(tmux_pane,'')
+         FROM sessions WHERE COALESCE(agent_type,'')='' AND COALESCE(agent_client,'claude')='claude';" 2>/dev/null)
 }
 
 # ── status bar render ─────────────────────────────────────────────────
 
+# $1 = optional SPILL warning text (e.g. "SPILL S91 C82") rendered in red.
 _write_cache() {
     _load_config_fast
+    local warn="${1:-}"
     local counts waiting gaveup
     counts=$(sql "SELECT
         COALESCE(SUM(CASE WHEN status IN ('waiting','retrying') THEN 1 ELSE 0 END),0) || '|' ||
@@ -204,13 +324,57 @@ _write_cache() {
         [[ "$gaveup" -gt 0 ]] && final+=" ${gaveup}${ICON_GAVEUP:-x}"
         final+="#[default]"
     fi
+    if [[ -n "$warn" ]]; then
+        [[ -n "$final" ]] && final+=" "
+        final+="#[fg=red,bold]${warn}#[default]"
+    fi
     printf '%s' "$final" > "$CACHE.tmp" 2>/dev/null || true
     mv -f "$CACHE.tmp" "$CACHE" 2>/dev/null || true
     tmux set -gq @agent-resumer-status "$final" 2>/dev/null || true
 }
 
+# Emit "SPILL S<pct> W<pct> C<pct>" for any window at/over its warn threshold
+# (i.e. next tokens would spill into paid overage), else nothing. #2.
+_usage_warn() {
+    python3 - "$1" "${WARN_SESSION:-90}" "${WARN_WEEKLY:-90}" "${WARN_CREDITS:-80}" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+ws,ww,wc=float(sys.argv[2]),float(sys.argv[3]),float(sys.argv[4])
+def util(o):
+    try: return float((o or {}).get("utilization",0))
+    except Exception: return 0.0
+toks=[]
+s=util(d.get("five_hour"));    # 5h session window
+if s>=ws: toks.append(f"S{int(round(s))}")
+w=util(d.get("seven_day"))
+if w>=ww: toks.append(f"W{int(round(w))}")
+sp=d.get("spend") or {}
+try: c=float(sp.get("percent",0))
+except Exception: c=0.0
+if sp.get("enabled") and c>=wc: toks.append(f"C{int(round(c))}")
+if toks: print("SPILL "+" ".join(toks))
+PY
+}
+
 cmd_status_bar() { [[ -f "$CACHE" ]] && cat "$CACHE" || true; }
-cmd_refresh() { [[ -f "$DB" ]] && _write_cache 2>/dev/null || true; }
+
+cmd_refresh() {
+    [[ -f "$DB" ]] || return 0
+    _load_config_fast
+    local warn="" uf
+    if uf=$(cmd_usage_fetch 2>/dev/null); then warn=$(_usage_warn "$uf"); fi
+    # Throttled, hook-independent scan to enqueue newly-limited sessions (#3).
+    if [[ "${ENABLED:-off}" == "on" ]]; then
+        local stamp="$RESUMER_DIR/.last_scan" now last=0
+        now=$(date +%s)
+        [[ -f "$stamp" ]] && last=$(_file_mtime "$stamp" 2>/dev/null || echo 0)
+        if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]]; then
+            touch "$stamp"; cmd_scan 2>/dev/null || true
+        fi
+    fi
+    _write_cache "$warn" 2>/dev/null || true
+}
 
 # ── cleanup ───────────────────────────────────────────────────────────
 

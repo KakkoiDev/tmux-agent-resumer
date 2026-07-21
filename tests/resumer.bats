@@ -91,3 +91,38 @@ teardown() { rm -rf "$TMPD"; }
     run sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table' AND name='limited';"
     [ "$output" = "limited" ]
 }
+
+@test "spill warn: fires above thresholds" {
+    WARN_SESSION=90 WARN_WEEKLY=90 WARN_CREDITS=80
+    printf '%s' '{"five_hour":{"utilization":93},"seven_day":{"utilization":40},"spend":{"enabled":true,"percent":85}}' > "$TMPD/hot.json"
+    run _usage_warn "$TMPD/hot.json"
+    [[ "$output" == *"SPILL"* ]]
+    [[ "$output" == *"S93"* ]]
+    [[ "$output" == *"C85"* ]]
+    [[ "$output" != *"W"* ]]   # weekly 40% under threshold
+}
+
+@test "spill warn: silent below thresholds (your live numbers)" {
+    WARN_SESSION=90 WARN_WEEKLY=90 WARN_CREDITS=80
+    printf '%s' '{"five_hour":{"utilization":33},"seven_day":{"utilization":19},"spend":{"enabled":true,"percent":15}}' > "$TMPD/cool.json"
+    run _usage_warn "$TMPD/cool.json"
+    [ -z "$output" ]
+}
+
+@test "spill warn: credits ignored when overage disabled" {
+    WARN_CREDITS=80
+    printf '%s' '{"spend":{"enabled":false,"percent":99}}' > "$TMPD/nocredit.json"
+    run _usage_warn "$TMPD/nocredit.json"
+    [ -z "$output" ]
+}
+
+@test "retry no-ops (no typing) when disabled" {
+    bash "$SCRIPT" init >/dev/null
+    sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,status) VALUES ('s','%1','usage','/tmp/x','waiting');"
+    ENABLED=off
+    run cmd_retry s
+    [ "$status" -eq 0 ]
+    # row untouched (still waiting, retry_count 0) since disabled
+    run sqlite3 "$DB" "SELECT status||':'||retry_count FROM limited WHERE session_id='s';"
+    [ "$output" = "waiting:0" ]
+}

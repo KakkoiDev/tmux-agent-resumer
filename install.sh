@@ -54,16 +54,17 @@ fi
 
 cat <<EOF
 
-==> done (observational mode)
-Try it now:  <prefix>+${RESUMER_KEY}   (shows usage + any paused agents)
+==> done
+Try it now:  <prefix>+${RESUMER_KEY}   (usage %, resets, credits + any paused agents)
+Status bar shows a red SPILL badge when a window nears the paid-overage threshold.
 
 Persist across tmux restarts - add to ~/.tmux.conf:
   run-shell $PLUGIN_DIR/agent-resumer.tmux
-
 Optional status-bar badge: add  #{@agent-resumer-status}  to status-right.
 
-REPRO GATE (before enabling auto-resume):
-  next time an agent hits a limit, check ~/.tmux-agent-resumer/debug.log for a
-  "DETECTED 429" line (proves the hook fires); note the pane state. Only then
-  wire the resume path and:  tmux set -g @agent-resumer-enabled on
+Auto-resume is OFF by default (nothing types into a pane yet). Before enabling:
+  1. On the next real limit hit, check ~/.tmux-agent-resumer/debug.log for
+     "DETECTED 429" (proves the hook fires) and note the pane state.
+  2. Confirm 'resume'+Enter continues the post-429 TUI (else set
+     @agent-resumer-resume-prompt). Then:  tmux set -g @agent-resumer-enabled on
 EOF

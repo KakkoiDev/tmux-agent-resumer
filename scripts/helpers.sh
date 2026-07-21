@@ -54,6 +54,9 @@ BACKOFF_CAP=""
 USAGE_RETRY_CAP=""
 SPEND_RETRY_CAP=""
 RESUME_PROMPT=""
+WARN_SESSION=""
+WARN_WEEKLY=""
+WARN_CREDITS=""
 DEBUG_LOG=""
 
 load_config() {
@@ -79,7 +82,11 @@ load_config() {
     BACKOFF_CAP=$(get_tmux_option "@agent-resumer-backoff-cap" "3600")
     USAGE_RETRY_CAP=$(get_tmux_option "@agent-resumer-usage-retry-cap" "12")
     SPEND_RETRY_CAP=$(get_tmux_option "@agent-resumer-spend-retry-cap" "48")
-    RESUME_PROMPT=$(get_tmux_option "@agent-resumer-resume-prompt" "continue")
+    RESUME_PROMPT=$(get_tmux_option "@agent-resumer-resume-prompt" "resume")
+    # Spill-alert thresholds (percent). Crossing = next tokens hit paid overage.
+    WARN_SESSION=$(get_tmux_option "@agent-resumer-warn-session" "90")
+    WARN_WEEKLY=$(get_tmux_option "@agent-resumer-warn-weekly" "90")
+    WARN_CREDITS=$(get_tmux_option "@agent-resumer-warn-credits" "80")
     DEBUG_LOG=$(get_tmux_option "@agent-resumer-debug-log" "1")
 
     cat > "${cache}.tmp" <<EOF
@@ -93,6 +100,9 @@ BACKOFF_CAP='$BACKOFF_CAP'
 USAGE_RETRY_CAP='$USAGE_RETRY_CAP'
 SPEND_RETRY_CAP='$SPEND_RETRY_CAP'
 RESUME_PROMPT='$RESUME_PROMPT'
+WARN_SESSION='$WARN_SESSION'
+WARN_WEEKLY='$WARN_WEEKLY'
+WARN_CREDITS='$WARN_CREDITS'
 DEBUG_LOG='$DEBUG_LOG'
 EOF
     mv -f "${cache}.tmp" "$cache"

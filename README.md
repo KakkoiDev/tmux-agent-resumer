@@ -1,39 +1,59 @@
 # tmux-agent-resumer
 
-Detect Claude Code agents in tmux panes that died mid-turn on an API limit
-(HTTP 429), and resume them via poll-and-retry with backoff. Sibling to
-[tmux-agent-tracker](../tmux-agent-tracker).
+Monitor Claude Code usage from tmux, warn before you spill into paid overage, and
+auto-resume agents that stalled on a rate limit once their window resets. Sibling to
+[tmux-agent-tracker](../tmux-agent-tracker). Pure bash + SQLite, hook-driven, no daemon.
 
-## Status: scaffold (resume path held behind a reproduction gate)
+## Features
 
-Two limit types, handled differently (see the plan doc for the full investigation):
+### `<prefix>+R` modal - usage + paused agents
+Shows your live limits and every agent currently waiting on a limit:
+```
+Session  33%   resets Tue 18:29 (3h)
+Weekly   19%   resets Sun 03:59 (4d)
+  Fable weekly: 3%
+Credits  15%   (7.65/50.00 USD)
+---
+! project-x [usage]     <- select to jump to that pane
+Refresh (r)   Quit (q)
+```
+Usage comes from `GET /api/oauth/usage` (OAuth token from the macOS keychain,
+`Claude Code-credentials`), cached to `~/.claude.json` as fallback. Selecting a paused
+agent runs `switch-client`/`select-window`/`select-pane` to it.
 
-| | Spend cap | Usage rate limit (5h / weekly) |
-|---|---|---|
-| Message | "monthly spend limit" | "session/weekly/Opus/Sonnet/Fable 5 limit" |
-| Cleared by waiting? | No (admin `/usage-credits` or billing cycle) | Yes |
-| Reset time on disk? | Never | Only a lossy display string, sometimes |
-| Behavior | long-capped backoff + notify | exponential backoff, resumes after reset |
+### Spill alert (#2)
+The status bar shows a red `SPILL S91 C82` when the session/weekly/credits utilization
+crosses its threshold - i.e. the next tokens would spill from your included plan into
+**paid** overage. Purely informational; lets you choose pause vs pay.
 
-The reset epoch (`anthropic-ratelimit-unified-reset`) is never persisted locally,
-so this tool does **not** schedule to an exact reset instant. Poll-and-retry with
-backoff needs no reset epoch.
+### Auto-resume (#3) - opt-in, default OFF
+When an agent's turn dies on a 429, resumer types the resume prompt (default `resume`)
+into that pane to re-issue the request. This does **not** bypass anything: the API still
+enforces the limit server-side; a retry while still limited just 429s again and backs off.
+For usage/rate limits the first retry is scheduled at the real reset time (from the usage
+endpoint); the spend cap uses a long bounded backoff. Guards: never types into a pane a
+client is actively viewing; gives up if the pane/agent is gone or the retry cap is hit.
 
-### What ships now (safe, no pane side effects)
-- `resumer.sh detect-file <transcript.jsonl>` - pure analyzer; prints `NONE` or `<type>\t<message>`.
-- `resumer.sh hook <event>` - **observational**: logs whether the hook fired and
-  whether a 429 was seen. Writes no state, types nothing.
-- `init` / `status-bar` / `refresh` / `cleanup` plumbing + `limited` table schema.
+Enable it only after confirming it works for you (see gate below):
+```
+tmux set -g @agent-resumer-enabled on
+```
 
-### Held until the reproduction gate passes
-- The `limited` state machine (insert / backoff / reschedule).
-- `cmd_retry`'s `tmux send-keys` resume (guarded by `@agent-resumer-enabled`, default `off`).
+## Install
+```
+./install.sh          # registers Stop+StopFailure hooks (symlink-safe), binds <prefix>+R
+```
+Persist across tmux restarts - add to `~/.tmux.conf`:
+```
+run-shell /path/to/tmux-agent-resumer/agent-resumer.tmux
+```
 
-**Reproduction gate** (do this before enabling resume):
-1. `./install.sh` (registers `Stop` + `StopFailure` hooks in `~/.claude/settings.json`; makes a backup).
-2. Next time an agent hits a limit, check `~/.tmux-agent-resumer/debug.log` for a
-   `DETECTED 429` line. That proves the hook fires. Note the pane state (idle prompt? empty input box?).
-3. Only then wire the resume path and `tmux set -g @agent-resumer-enabled on`.
+## Verification gate (before enabling auto-resume)
+1. Install. Open `<prefix>+R` - confirm your usage shows.
+2. On the next real limit hit, check `~/.tmux-agent-resumer/debug.log` for a `DETECTED 429`
+   line (proves the Stop/StopFailure hook fires) and note the pane state.
+3. Confirm `resume`+Enter is what the post-429 TUI needs to continue (adjust
+   `@agent-resumer-resume-prompt` if not). Then set `@agent-resumer-enabled on`.
 
 ## Test
 ```
@@ -41,15 +61,17 @@ bats tests/resumer.bats
 ```
 
 ## Config (tmux options)
-`@agent-resumer-enabled` (off), `@agent-resumer-usage-backoff-floor` (120),
-`@agent-resumer-spend-backoff-floor` (1800), `@agent-resumer-backoff-cap` (3600),
-`@agent-resumer-usage-retry-cap` (12), `@agent-resumer-spend-retry-cap` (48),
-`@agent-resumer-resume-prompt` (continue), `@agent-resumer-debug-log` (1).
+`@agent-resumer-enabled` (off), `@agent-resumer-key` (R),
+`@agent-resumer-resume-prompt` (resume),
+`@agent-resumer-warn-session` (90), `@agent-resumer-warn-weekly` (90),
+`@agent-resumer-warn-credits` (80),
+`@agent-resumer-usage-backoff-floor` (120), `@agent-resumer-spend-backoff-floor` (1800),
+`@agent-resumer-backoff-cap` (3600), `@agent-resumer-usage-retry-cap` (12),
+`@agent-resumer-spend-retry-cap` (48), `@agent-resumer-debug-log` (1).
 
-## Known unknowns (honest)
-- Whether `Stop`/`StopFailure` fires on a 429 is unconfirmed - the whole trigger depends on it.
-  If it does not, fall back to a periodic transcript-tail poller.
-- Whether `send-keys "continue"` reliably resumes is unconfirmed.
-- Spend-cap retries are mostly futile within a billing month; the honest behavior there is
-  long-backoff + notify, not fast retry.
-- JSON matcher spacing assumptions need validation against a real transcript.
+## Honest unknowns
+- Whether `Stop`/`StopFailure` fires on a 429 is unconfirmed - the hook-driven trigger
+  depends on it. A hook-independent periodic scan (`cmd_scan` via `refresh`) is the fallback.
+- Whether `resume`+Enter is the exact keystroke the post-429 TUI needs is unconfirmed.
+- The send-keys mechanism itself is verified (keystrokes reach the target pane).
+- Spend-cap retries are mostly futile within a billing month; expect give-up + a badge there.
