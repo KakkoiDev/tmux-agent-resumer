@@ -59,6 +59,7 @@ WARN_WEEKLY=""
 WARN_CREDITS=""
 IDLE_GRACE=""
 CAFFEINATE=""
+NTFY_TOPIC=""
 DEBUG_LOG=""
 
 load_config() {
@@ -94,6 +95,8 @@ load_config() {
     # Hold a caffeinate (block idle sleep) while any agent is paused, so the resume
     # timer survives lunch. Does not beat closing the lid.
     CAFFEINATE=$(get_tmux_option "@agent-resumer-caffeinate" "on")
+    # ntfy.sh topic for phone push on limit-hit / resume / give-up. Empty = off.
+    NTFY_TOPIC=$(get_tmux_option "@agent-resumer-ntfy-topic" "")
     DEBUG_LOG=$(get_tmux_option "@agent-resumer-debug-log" "1")
 
     cat > "${cache}.tmp" <<EOF
@@ -112,6 +115,7 @@ WARN_WEEKLY='$WARN_WEEKLY'
 WARN_CREDITS='$WARN_CREDITS'
 IDLE_GRACE='$IDLE_GRACE'
 CAFFEINATE='$CAFFEINATE'
+NTFY_TOPIC='$NTFY_TOPIC'
 DEBUG_LOG='$DEBUG_LOG'
 EOF
     mv -f "${cache}.tmp" "$cache"

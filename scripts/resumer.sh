@@ -47,6 +47,13 @@ _debug_log() {
     fi
 }
 
+# Phone push via ntfy.sh. No-op unless @agent-resumer-ntfy-topic is set. #3.
+_notify() {
+    _load_config_fast
+    [[ -n "${NTFY_TOPIC:-}" ]] || return 0
+    ( curl -s -m 5 -d "$1" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null 2>&1 & )
+}
+
 # Flat "key":"value" extraction (no jq at runtime). Same as tracker's _json_val.
 _json_val() {
     local _t="${1#*\"$2\":\"}"
@@ -254,6 +261,7 @@ _enqueue_limited() {
          VALUES ('$(sql_esc "$sid")','$(sql_esc "$pane")','$(sql_esc "$target")','$(sql_esc "$type")',
              '$(sql_esc "$tp")','$(sql_esc "$rp")',0,$floor,$((now+delay)),'waiting',$now,$now);"
     _debug_log "enqueue sid=$sid type=$type pane=$pane first-retry=${delay}s"
+    _notify "resumer: agent hit ${type} limit (pane ${pane:-?}). Waiting; will auto-resume at reset."
     _schedule_retry "$sid" "$delay"
     _caffeinate_sync
 }
@@ -269,7 +277,7 @@ cmd_retry() {
         return 0
     fi
     local info
-    info=$(sql "SELECT status||'\t'||COALESCE(tmux_pane,'')||'\t'||limit_type||'\t'||transcript_path||'\t'||retry_count||'\t'||backoff_secs||'\t'||COALESCE(resume_prompt,'resume')
+    info=$(sql "SELECT status||char(9)||COALESCE(tmux_pane,'')||char(9)||limit_type||char(9)||transcript_path||char(9)||retry_count||char(9)||backoff_secs||char(9)||COALESCE(resume_prompt,'resume')
                FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
     [[ -z "$info" ]] && return 0
     local st pane type tp rc backoff rp
@@ -309,12 +317,14 @@ cmd_retry() {
     # Cleared already?
     if ! _detect_limit_line "$tp" >/dev/null; then
         sql "UPDATE limited SET status='resumed',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
-        _debug_log "RETRY sid=$sid RESUMED (transcript no longer 429)"; return 0
+        _debug_log "RETRY sid=$sid RESUMED (transcript no longer 429)"
+        _notify "resumer: agent resumed (pane ${pane})."; return 0
     fi
     local cap="${USAGE_RETRY_CAP:-12}"; [[ "$type" == "spend" ]] && cap="${SPEND_RETRY_CAP:-48}"
     if [[ "$rc" -ge "$cap" ]]; then
         sql "UPDATE limited SET status='gaveup',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
-        _debug_log "RETRY sid=$sid gaveup: still limited after $cap attempts"; return 0
+        _debug_log "RETRY sid=$sid gaveup: still limited after $cap attempts"
+        _notify "resumer: gave up on paused agent (pane ${pane}) after $cap attempts."; return 0
     fi
     # Type the resume prompt into the pane. This only RE-ISSUES the request; the
     # API still enforces the limit - if the window is still closed it 429s again
@@ -370,15 +380,19 @@ _write_cache() {
     fi
     if [[ -n "$warn" ]]; then
         [[ -n "$final" ]] && final+=" "
-        final+="#[fg=red,bold]${warn}#[default]"
+        final+="$warn"   # already color-coded by _usage_warn (THROTTLE yellow / SPEND red)
     fi
     printf '%s' "$final" > "$CACHE.tmp" 2>/dev/null || true
     mv -f "$CACHE.tmp" "$CACHE" 2>/dev/null || true
     tmux set -gq @agent-resumer-status "$final" 2>/dev/null || true
 }
 
-# Emit "SPILL S<pct> W<pct> C<pct>" for any window at/over its warn threshold
-# (i.e. next tokens would spill into paid overage), else nothing. #2.
+# Badge warnings (accurate, no free/paid editorializing - session-max DOES spill
+# into paid credits when extra-usage is on, confirmed empirically):
+#   LIMIT   (yellow) = session/weekly plan window near full. At 100% Claude starts
+#                      spending usage credits automatically.
+#   CREDITS (red)    = paid usage-credit pool near its $ cap -> hard block next.
+# Prints the pre-colored tmux segment(s), or nothing. #1 + #2.
 _usage_warn() {
     python3 - "$1" "${WARN_SESSION:-90}" "${WARN_WEEKLY:-90}" "${WARN_CREDITS:-80}" <<'PY' 2>/dev/null || true
 import json,sys
@@ -388,17 +402,48 @@ ws,ww,wc=float(sys.argv[2]),float(sys.argv[3]),float(sys.argv[4])
 def util(o):
     try: return float((o or {}).get("utilization",0))
     except Exception: return 0.0
-toks=[]
-s=util(d.get("five_hour"));    # 5h session window
-if s>=ws: toks.append(f"S{int(round(s))}")
+thr=[]
+s=util(d.get("five_hour"))
+if s>=ws: thr.append(f"S{int(round(s))}")
 w=util(d.get("seven_day"))
-if w>=ww: toks.append(f"W{int(round(w))}")
+if w>=ww: thr.append(f"W{int(round(w))}")
+spend=[]
 sp=d.get("spend") or {}
 try: c=float(sp.get("percent",0))
 except Exception: c=0.0
-if sp.get("enabled") and c>=wc: toks.append(f"C{int(round(c))}")
-if toks: print("SPILL "+" ".join(toks))
+if sp.get("enabled") and c>=wc: spend.append(f"C{int(round(c))}")
+seg=[]
+# Background-block badges: high contrast on any status-bar colour.
+if thr:   seg.append("#[fg=black,bg=yellow,bold] LIMIT "+" ".join(thr)+" #[default]")
+if spend: seg.append("#[fg=white,bg=red,bold] CREDITS "+" ".join(spend)+" #[default]")
+if seg: print(" ".join(seg))
 PY
+}
+
+# Append session/weekly/credit numbers to a CSV, but only when a value changed -
+# a delta log. Answers "when did credits move, and by how much" empirically. #2.
+_usage_log() {
+    local uf="$1" csv="$RESUMER_DIR/usage.csv" vals last
+    [[ -f "$uf" ]] || return 0
+    vals=$(python3 - "$uf" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+def u(o):
+    try: return round(float((o or {}).get("utilization",0)),1)
+    except Exception: return 0.0
+sp=d.get("spend") or {}
+usd=(sp.get("used") or {})
+used=usd.get("amount_minor",0)/10**int(usd.get("exponent",2) or 2)
+print(f"{u(d.get('five_hour'))},{u(d.get('seven_day'))},{sp.get('percent',0)},{used:.2f}")
+PY
+)
+    [[ -z "$vals" ]] && return 0
+    [[ -f "$csv" ]] || echo "epoch,iso,session_pct,weekly_pct,credits_pct,credits_used_usd" > "$csv"
+    last=$(tail -1 "$csv" 2>/dev/null | cut -d, -f3-)
+    [[ "$last" == "$vals" ]] && return 0   # unchanged -> skip (delta only)
+    printf '%s,%s,%s\n' "$(date +%s)" "$(date '+%Y-%m-%dT%H:%M:%S')" "$vals" >> "$csv"
+    _debug_log "usage.csv +row: $vals"
 }
 
 cmd_status_bar() { [[ -f "$CACHE" ]] && cat "$CACHE" || true; }
@@ -407,7 +452,7 @@ cmd_refresh() {
     [[ -f "$DB" ]] || return 0
     _load_config_fast
     local warn="" uf
-    if uf=$(cmd_usage_fetch 2>/dev/null); then warn=$(_usage_warn "$uf"); fi
+    if uf=$(cmd_usage_fetch 2>/dev/null); then warn=$(_usage_warn "$uf"); _usage_log "$uf"; fi
     # Throttled, hook-independent scan to enqueue newly-limited sessions (#3).
     if [[ "${ENABLED:-off}" == "on" ]]; then
         local stamp="$RESUMER_DIR/.last_scan" now last=0
@@ -555,29 +600,35 @@ cmd_menu() {
 
     args+=("" "" "")   # separator
 
-    local found=0
-    if [[ -f "$TRACKER_DB" ]]; then
-        local sid target project tp line type label
-        while IFS='|' read -r sid target project; do
-            [[ -z "$sid" ]] && continue
-            tp=$(_transcript_for "$sid")
-            [[ -z "$tp" ]] && continue
-            if line=$(_detect_limit_line "$tp"); then
-                type=$(_classify_limit "$(_json_val "$line" "text")")
-                found=$((found+1))
-                label="! ${project:-?} [${type}]"
-                if [[ -n "$target" ]]; then
-                    args+=("$label" "" "run-shell '$SCRIPTS_DIR/resumer.sh goto ${target}'")
-                else
-                    args+=("$label (no pane)" "" "")
-                fi
-            fi
-        done < <(sqlite3 -separator '|' "$TRACKER_DB" \
-            "SELECT session_id, COALESCE(tmux_target,''), COALESCE(project_name,'')
-             FROM sessions WHERE COALESCE(agent_type,'')='' AND COALESCE(agent_client,'claude')='claude';" 2>/dev/null)
-    else
-        args+=("(tmux-agent-tracker DB not found - can't list panes)" "" "")
-    fi
+    # Freshen the limited table so the list reflects current state.
+    [[ "${ENABLED:-off}" == "on" ]] && { cmd_scan 2>/dev/null || true; }
+
+    local found=0 nowm sid type target next st proj eta rel d label
+    nowm=$(date +%s)
+    while IFS='|' read -r sid type target next st; do
+        [[ -z "$sid" ]] && continue
+        found=$((found+1))
+        proj=""
+        [[ -f "$TRACKER_DB" ]] && proj=$(sqlite3 "$TRACKER_DB" \
+            "SELECT project_name FROM sessions WHERE session_id='$(sql_esc "$sid")' LIMIT 1;" 2>/dev/null || true)
+        [[ -z "$proj" ]] && proj="${target:-$sid}"
+        label="! ${proj} [${type}]"
+        if [[ "${next:-0}" -gt 0 ]]; then
+            eta=$(date -r "$next" '+%H:%M' 2>/dev/null || true)
+            d=$(( next - nowm ))
+            if   [[ "$d" -le 0 ]]; then rel="due now"
+            elif [[ "$d" -lt 3600 ]]; then rel="in $((d/60))m"
+            else rel="in $((d/3600))h$(( (d%3600)/60 ))m"; fi
+            [[ -n "$eta" ]] && label="${label} resume ~${eta} (${rel})"
+        fi
+        [[ "$st" == "retrying" ]] && label="${label} [retrying]"
+        if [[ -n "$target" ]]; then
+            args+=("$label" "" "run-shell '$SCRIPTS_DIR/resumer.sh goto ${target}'")
+        else
+            args+=("$label (no pane)" "" "")
+        fi
+    done < <(sql "SELECT session_id||'|'||limit_type||'|'||COALESCE(tmux_target,'')||'|'||COALESCE(next_retry_at,0)||'|'||status
+                  FROM limited WHERE status IN ('waiting','retrying') ORDER BY COALESCE(next_retry_at,0);" 2>/dev/null)
     [[ "$found" -eq 0 ]] && args+=("No paused agents" "" "")
 
     args+=("" "" "")

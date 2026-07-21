@@ -95,17 +95,18 @@ teardown() {
     [ "$output" = "limited" ]
 }
 
-@test "spill warn: fires above thresholds" {
+@test "warn badge: LIMIT (session/weekly) and CREDITS split correctly" {
     WARN_SESSION=90 WARN_WEEKLY=90 WARN_CREDITS=80
     printf '%s' '{"five_hour":{"utilization":93},"seven_day":{"utilization":40},"spend":{"enabled":true,"percent":85}}' > "$TMPD/hot.json"
     run _usage_warn "$TMPD/hot.json"
-    [[ "$output" == *"SPILL"* ]]
+    [[ "$output" == *"LIMIT"* ]]         # session over -> plan-limit segment
     [[ "$output" == *"S93"* ]]
+    [[ "$output" == *"CREDITS"* ]]       # credits over -> credit segment
     [[ "$output" == *"C85"* ]]
-    [[ "$output" != *"W"* ]]   # weekly 40% under threshold
+    [[ "$output" != *"W40"* ]]           # weekly 40% under threshold
 }
 
-@test "spill warn: silent below thresholds (your live numbers)" {
+@test "warn badge: silent below thresholds (your live numbers)" {
     WARN_SESSION=90 WARN_WEEKLY=90 WARN_CREDITS=80
     printf '%s' '{"five_hour":{"utilization":33},"seven_day":{"utilization":19},"spend":{"enabled":true,"percent":15}}' > "$TMPD/cool.json"
     run _usage_warn "$TMPD/cool.json"
@@ -139,6 +140,47 @@ teardown() {
     _caffeinate_sync
     [ ! -f "$RESUMER_DIR/caffeinate.pid" ]          # released
     run kill -0 "$p"; [ "$status" -ne 0 ]           # process gone
+}
+
+@test "integration: retry sends resume while limited, then resumed when cleared" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on CAFFEINATE=off NTFY_TOPIC=""
+    SENT="$TMPD/sent"; : > "$SENT"
+    # test doubles: fake a live, non-viewed pane with a live agent
+    tmux() {
+        local a="$*"
+        case "$a" in
+            "list-panes -a -F #{pane_id}") echo "%9" ;;
+            *"-p #{pane_pid}"*) echo 4242 ;;
+            *pane_active*) echo 0 ;;                 # not being viewed
+            *"send-keys"*) printf '%s\n' "$a" >> "$SENT" ;;
+            *) : ;;                                  # swallow run-shell etc.
+        esac
+    }
+    _has_agent_child() { return 0; }
+    local TP="$TMPD/it.jsonl"
+    printf '%s\n' "$SPEND_LINE" > "$TP"              # transcript ends in a 429
+    sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,resume_prompt,retry_count,backoff_secs,next_retry_at,status) VALUES ('it','%9','s:1.9','usage','$TP','resume',0,120,$(date +%s),'waiting');"
+
+    cmd_retry it                                     # still limited -> should send resume
+    grep -q "send-keys -t %9 resume Enter" "$SENT"
+    run sqlite3 "$DB" "SELECT status||':'||retry_count FROM limited WHERE session_id='it';"
+    [ "$output" = "retrying:1" ]
+
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}' > "$TP"
+    cmd_retry it                                     # cleared -> resumed
+    run sqlite3 "$DB" "SELECT status FROM limited WHERE session_id='it';"
+    [ "$output" = "resumed" ]
+}
+
+@test "integration: retry gives up when pane is gone" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on
+    tmux() { case "$*" in "list-panes -a -F #{pane_id}") echo "%1" ;; *) : ;; esac; }  # %9 not listed
+    sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,status) VALUES ('g','%9','usage','/tmp/x','waiting');"
+    cmd_retry g
+    run sqlite3 "$DB" "SELECT status FROM limited WHERE session_id='g';"
+    [ "$output" = "gaveup" ]
 }
 
 @test "retry no-ops (no typing) when disabled" {
