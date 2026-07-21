@@ -199,9 +199,9 @@ _schedule_retry() {
 
 # Keep the Mac awake while any agent is paused, so the scheduled resume timer
 # survives idle sleep (Claude's own caffeinate lapses once the agent stalls).
-# Holds `caffeinate -i` while waiting/retrying rows exist, releases otherwise.
-# Self-expiring (-t) so a dead resumer can't pin the machine awake forever;
-# refresh (<=status-interval) relaunches it while still needed.
+# Holds ONE continuous `caffeinate -i` for the whole wait (no 15-min gaps) and
+# ties its lifetime to the tmux server via -w, so it can't outlive tmux or pin
+# the machine awake forever. Released (killed) the moment nothing is paused.
 _caffeinate_sync() {
     _load_config_fast
     [[ "${CAFFEINATE:-on}" == "on" ]] || return 0
@@ -212,9 +212,15 @@ _caffeinate_sync() {
         if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then running="$p"; else rm -f "$pidf"; fi
     fi
     if [[ "${n:-0}" -gt 0 && -z "$running" ]]; then
-        caffeinate -i -t 900 >/dev/null 2>&1 &
+        # Hold until we kill it or the tmux server exits (whichever first).
+        local tpid; tpid=$(tmux display-message -p '#{pid}' 2>/dev/null || true)
+        if [[ -n "$tpid" ]]; then
+            caffeinate -i -w "$tpid" >/dev/null 2>&1 &
+        else
+            caffeinate -i -t 3600 >/dev/null 2>&1 &   # fallback: bounded, no tmux
+        fi
         echo $! > "$pidf"
-        _debug_log "caffeinate on (pid $!) - $n paused agent(s)"
+        _debug_log "caffeinate on (pid $!, held for tmux $tpid) - $n paused agent(s)"
     elif [[ "${n:-0}" -eq 0 && -n "$running" ]]; then
         kill "$running" 2>/dev/null || true
         rm -f "$pidf"
