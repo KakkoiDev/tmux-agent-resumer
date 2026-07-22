@@ -208,6 +208,11 @@ cmd_hook() {
 _seconds_until_reset() {
     local key="${1:-five_hour}"
     [[ -f "$USAGE_JSON" ]] || return 1
+    # Don't trust resets_at from a stale usage.json - a stale fallback cache points
+    # at a PREVIOUS window boundary, which is what made a resume ETA show ~1h10 when
+    # the real reset was minutes away. Older than 10min -> refuse (caller uses floor).
+    local age; age=$(( $(date +%s) - $(_file_mtime "$USAGE_JSON" 2>/dev/null || echo 0) ))
+    [[ "$age" -gt 600 ]] && return 1
     python3 - "$USAGE_JSON" "$key" <<'PY' 2>/dev/null || true
 import json,sys,datetime
 try: d=json.load(open(sys.argv[1]))
