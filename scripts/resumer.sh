@@ -914,8 +914,13 @@ cmd_goto() {
 cmd_selftest() {
     local pane="${1:?Usage: resumer.sh selftest <pane-id> [--submit]}" submit="${2:-}"
     _load_config_fast
-    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane" \
-        || { echo "pane $pane not found (run 'tmux list-panes -a' to find your Claude pane)"; return 1; }
+    # Accept a bare number (%N is the real id) for convenience.
+    [[ "$pane" =~ ^[0-9]+$ ]] && pane="%$pane"
+    if ! tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane"; then
+        echo "pane '$pane' not found. Available panes (use the %N id, not the list number):"
+        tmux list-panes -a -F '  #{pane_id}  #{session_name}:#{window_index}.#{pane_index}  #{pane_current_command}' 2>/dev/null
+        return 1
+    fi
     local rp="${RESUME_PROMPT:-resume}" esc="${INTERRUPT_ESCAPES:-1}" i
     echo "=== pane $pane BEFORE (last 4 lines) ==="; tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     echo "=== sending Escape x$esc (should interrupt a running turn) ==="
