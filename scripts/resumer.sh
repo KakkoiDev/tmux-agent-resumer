@@ -511,18 +511,29 @@ _credits_pct()  { _num_field "$USAGE_JSON" "spend.percent"; }
 # so the continuous guard does not re-Escape a paused agent every tick.
 _credit_guard_interrupt() {
     [[ -f "$TRACKER_DB" ]] || return 0
-    local reset_secs now delay sid target pane st n=0 vim
+    local reset_secs now delay sid target pane n=0 vim
     reset_secs=$(_seconds_until_session_reset 2>/dev/null || echo 0)
     now=$(date +%s)
     delay=$(( ${reset_secs:-0} + 15 )); [[ "$delay" -lt 60 ]] && delay=300
     while IFS=$'\x1f' read -r sid target pane; do
         [[ -z "$sid" || -z "$pane" ]] && continue
-        st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
-        [[ "$st" == "waiting" || "$st" == "retrying" ]] && continue   # already handled
+        # Debounce: never re-interrupt/re-type within COOLDOWN of the last action on
+        # this session. Prevents typing the notice dozens of times when the agent
+        # stays 'working' across scans, while still allowing a re-block after the
+        # cooldown (a genuinely resumed second attempt). age = secs since last touch.
+        local prevts age cool="${GUARD_COOLDOWN:-90}"
+        prevts=$(sql "SELECT updated_at FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
+        if [[ -n "$prevts" ]]; then
+            age=$(( now - prevts ))
+            [[ "$age" -lt "$cool" ]] && continue
+        fi
         vim=0; _pane_is_vim "$pane" && vim=1                          # detect BEFORE escaping
         _interrupt_pane "$pane" || true                               # spaced retries (nonzero = still busy; tolerate under set -e)
-        # Escape already sent (escaped=1) so _prep_input won't send a second one.
-        [[ -n "${CREDIT_NOTICE:-}" ]] && _type_prompt "$pane" "$CREDIT_NOTICE" 1 "$vim"   # typed, NOT submitted
+        if [[ -n "${CREDIT_NOTICE:-}" ]]; then
+            _prep_input "$pane" 1 "$vim"                              # insert state (Escape already sent)
+            tmux send-keys -t "$pane" C-u 2>/dev/null || true         # clear first so the notice never accumulates
+            tmux send-keys -t "$pane" -l "$CREDIT_NOTICE" 2>/dev/null || true   # typed, NOT submitted
+        fi
         sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
              INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
                  resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)

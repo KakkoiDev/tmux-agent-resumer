@@ -67,6 +67,7 @@ INTERRUPT_ESCAPES=""
 CREDIT_NOTICE=""
 RESUME_JITTER=""
 INTERRUPT_PAUSE=""
+GUARD_COOLDOWN=""
 VIM_MODE=""
 DEBUG_LOG=""
 
@@ -122,6 +123,9 @@ load_config() {
     # Seconds to wait after an interrupt Escape before typing, so the Escape lands
     # as a standalone interrupt instead of merging with the next key into a sequence.
     INTERRUPT_PAUSE=$(get_tmux_option "@agent-resumer-interrupt-pause" "1")
+    # Min seconds between credit-guard actions on the same session - stops the notice
+    # being re-typed every scan while an agent stays busy; still re-blocks after this.
+    GUARD_COOLDOWN=$(get_tmux_option "@agent-resumer-guard-cooldown" "90")
     # Claude Code vim-mode input: auto (detect from pane), on, or off. In vim mode
     # text must be typed in insert state or it is eaten as normal-mode commands.
     VIM_MODE=$(get_tmux_option "@agent-resumer-vim-mode" "auto")
@@ -150,6 +154,7 @@ INTERRUPT_ESCAPES='$INTERRUPT_ESCAPES'
 CREDIT_NOTICE='$CREDIT_NOTICE'
 RESUME_JITTER='$RESUME_JITTER'
 INTERRUPT_PAUSE='$INTERRUPT_PAUSE'
+GUARD_COOLDOWN='$GUARD_COOLDOWN'
 VIM_MODE='$VIM_MODE'
 DEBUG_LOG='$DEBUG_LOG'
 EOF
