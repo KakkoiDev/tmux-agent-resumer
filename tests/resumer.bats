@@ -287,6 +287,27 @@ teardown() {
     [ "$output" = "resumed" ]
 }
 
+@test "credit-guard: still-maxed retry keeps next_retry_at fixed (stable ETA)" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on CREDIT_THRESHOLD=100 NTFY_TOPIC=""
+    export USAGE_JSON="$TMPD/u.json"
+    printf '%s' '{"five_hour":{"utilization":100}}' > "$USAGE_JSON"   # still maxed
+    tmux() {
+        case "$*" in
+            "list-panes -a -F #{pane_id}") echo "%9" ;;
+            *"-p #{pane_pid}"*) echo 4242 ;;
+            *pane_active*) echo 0 ;;
+            *) : ;;
+        esac
+    }
+    _has_agent_child() { return 0; }
+    local FIXED=9999999999
+    sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,resume_prompt,retry_count,backoff_secs,next_retry_at,status) VALUES ('cgp','%9','credit-guard','','resume',0,120,$FIXED,'waiting');"
+    cmd_retry cgp
+    run sqlite3 "$DB" "SELECT next_retry_at||':'||status FROM limited WHERE session_id='cgp';"
+    [ "$output" = "$FIXED:waiting" ]   # ETA unchanged, still waiting (no backoff jump)
+}
+
 @test "sweep: prunes rows for dead/empty panes, keeps live ones" {
     bash "$SCRIPT" init >/dev/null
     ENABLED=off   # prune runs even when disabled; no retries fire

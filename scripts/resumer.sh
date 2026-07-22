@@ -442,10 +442,12 @@ cmd_retry() {
             _debug_log "credit-guard RESUME sid=$sid (session back to ${su}%)"
             _notify "resumer: session reset - resumed agent (pane ${pane})."; return 0
         fi
-        local nbg; nbg=$(_next_backoff "$backoff" usage)
-        sql "UPDATE limited SET status='waiting',retry_count=$((rc+1)),backoff_secs=$nbg,next_retry_at=$((now+nbg)),updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
-        _debug_log "credit-guard sid=$sid still maxed (${su:-?}%), wait ${nbg}s"
-        _schedule_retry "$sid" "$nbg"; return 0
+        # Still maxed: leave the row as-is. next_retry_at stays PINNED to the session
+        # reset (set at interrupt), so the modal ETA counts down steadily instead of
+        # jumping around with an exponential backoff. The sweep re-checks credit-guard
+        # rows every scan regardless, so no per-agent timer is needed here.
+        _debug_log "credit-guard sid=$sid still maxed (${su:-?}%); ETA pinned to reset"
+        return 0
     fi
     # Cleared already?
     if ! _detect_limit_line "$tp" >/dev/null; then
@@ -539,11 +541,18 @@ _credit_guard_interrupt() {
             tmux send-keys -t "$pane" C-u 2>/dev/null || true         # clear first so the notice never accumulates
             tmux send-keys -t "$pane" -l "$CREDIT_NOTICE" 2>/dev/null || true   # typed, NOT submitted
         fi
+        # Pin next_retry_at to the session reset and PRESERVE it across re-blocks so
+        # the modal ETA counts down steadily. Reuse any existing future schedule;
+        # only compute a fresh one when there's none (keeps ETA stable even if a later
+        # re-block hits a stale usage.json where the reset can't be read).
+        local prevnra nra
+        prevnra=$(sql "SELECT next_retry_at FROM limited WHERE session_id='$(sql_esc "$sid")' AND COALESCE(next_retry_at,0) > $now;" 2>/dev/null || true)
+        if [[ -n "$prevnra" ]]; then nra="$prevnra"; else nra=$(( now + delay )); fi
         sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
              INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
                  resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)
              VALUES ('$(sql_esc "$sid")','$(sql_esc "$pane")','$(sql_esc "$target")','credit-guard','',
-                 'resume',0,$delay,$((now+delay)),'waiting',$now,$now);"
+                 'resume',0,$delay,$nra,'waiting',$now,$now);"
         _schedule_retry "$sid" "$delay"
         n=$((n+1))
     done < <(sqlite3 -separator $'\x1f' "$TRACKER_DB" \
@@ -710,19 +719,26 @@ cmd_sweep() {
 cmd_refresh() {
     [[ -f "$DB" ]] || return 0
     _load_config_fast
-    local warn="" uf
-    if uf=$(cmd_usage_fetch 2>/dev/null); then warn=$(_usage_warn "$uf"); _usage_log "$uf"; fi
-    # Throttled + locked: only ONE client's refresh does the work per interval
-    # (many attached clients each call refresh on the same status-interval tick).
-    local stamp="$RESUMER_DIR/.last_scan" now last=0
+    local warn="" uf now
     now=$(date +%s)
+    if uf=$(cmd_usage_fetch 2>/dev/null); then warn=$(_usage_warn "$uf"); _usage_log "$uf"; fi
+    # Credit guard runs EVERY refresh (not the 30s scan throttle) so a new/second
+    # turn is caught within one status-interval. Cheap (cached usage + one tracker
+    # query); the 90s per-session cooldown prevents re-typing. Locked so concurrent
+    # clients don't double-fire.
+    if [[ "${ENABLED:-off}" == "on" ]] && _try_lock guard; then
+        cmd_credit_guard 2>/dev/null || true
+        _unlock guard
+    fi
+    # Heavier work (transcript scan, dead-pane prune, due retries, caffeinate) stays
+    # throttled - resume timing is tolerant, and these are more expensive.
+    local stamp="$RESUMER_DIR/.last_scan" last=0
     [[ -f "$stamp" ]] && last=$(_file_mtime "$stamp" 2>/dev/null || echo 0)
     if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]] && _try_lock refresh; then
         touch "$stamp"
         cmd_sweep 2>/dev/null || true            # prune dead panes + run due retries (also when disabled)
         if [[ "${ENABLED:-off}" == "on" ]]; then
             cmd_scan 2>/dev/null || true
-            cmd_credit_guard 2>/dev/null || true
             _caffeinate_sync 2>/dev/null || true
         fi
         _unlock refresh
