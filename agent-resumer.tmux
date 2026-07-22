@@ -10,6 +10,10 @@ ensure_tmux_version || exit 1
 load_config
 
 "$SCRIPTS_DIR/resumer.sh" init >/dev/null 2>&1
+# Reconcile after a (re)start: scheduled retry timers died with the previous tmux
+# server, so prune rows for panes that no longer exist and resolve any due ones.
+rm -f "${RESUMER_DIR:-$HOME/.tmux-agent-resumer}/.last_scan" 2>/dev/null || true
+"$SCRIPTS_DIR/resumer.sh" sweep >/dev/null 2>&1 || true
 
 _link_if_stale() {
     local target="$1" link="$2"

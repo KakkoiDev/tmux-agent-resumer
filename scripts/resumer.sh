@@ -548,21 +548,51 @@ PY
 
 cmd_status_bar() { [[ -f "$CACHE" ]] && cat "$CACHE" || true; }
 
+# Reconcile the limited table. THE self-healing heartbeat: scheduled sleep-timer
+# retries die with the tmux server, so refresh (called every status-interval and
+# on startup) drives resolution instead of relying on those timers.
+#   1. prune rows whose pane is gone (agent closed) or empty -> nothing to resume.
+#   2. run cmd_retry for rows that are due, plus all credit-guard rows (so they
+#      resume promptly once the session resets, not only at the scheduled tick).
+# Pruning runs even when disabled so stale entries/badge always clear.
+cmd_sweep() {
+    [[ -f "$DB" ]] || return 0
+    local live now sid in_list
+    live=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null | paste -sd, - 2>/dev/null || true)
+    now=$(date +%s)
+    if [[ -n "$live" ]]; then
+        in_list=$(printf "'%s'," ${live//,/ }); in_list="${in_list%,}"
+        sql "DELETE FROM limited WHERE status IN ('waiting','retrying')
+             AND (COALESCE(tmux_pane,'')='' OR tmux_pane NOT IN ($in_list));" 2>/dev/null || true
+    else
+        sql "DELETE FROM limited WHERE status IN ('waiting','retrying');" 2>/dev/null || true
+    fi
+    [[ "${ENABLED:-off}" == "on" ]] || return 0
+    while IFS= read -r sid; do
+        [[ -z "$sid" ]] && continue
+        cmd_retry "$sid" 2>/dev/null || true
+    done < <(sql "SELECT session_id FROM limited
+                  WHERE status IN ('waiting','retrying')
+                    AND (COALESCE(next_retry_at,0) <= $now OR limit_type='credit-guard');" 2>/dev/null)
+}
+
 cmd_refresh() {
     [[ -f "$DB" ]] || return 0
     _load_config_fast
     local warn="" uf
     if uf=$(cmd_usage_fetch 2>/dev/null); then warn=$(_usage_warn "$uf"); _usage_log "$uf"; fi
-    # Throttled, hook-independent scan to enqueue newly-limited sessions (#3).
-    if [[ "${ENABLED:-off}" == "on" ]]; then
-        local stamp="$RESUMER_DIR/.last_scan" now last=0
-        now=$(date +%s)
-        [[ -f "$stamp" ]] && last=$(_file_mtime "$stamp" 2>/dev/null || echo 0)
-        if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]]; then
-            touch "$stamp"; cmd_scan 2>/dev/null || true
+    # Throttled: reconcile stale/due rows + scan for new limits + guard + caffeinate.
+    local stamp="$RESUMER_DIR/.last_scan" now last=0
+    now=$(date +%s)
+    [[ -f "$stamp" ]] && last=$(_file_mtime "$stamp" 2>/dev/null || echo 0)
+    if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]]; then
+        touch "$stamp"
+        cmd_sweep 2>/dev/null || true            # prune dead panes + run due retries (also when disabled)
+        if [[ "${ENABLED:-off}" == "on" ]]; then
+            cmd_scan 2>/dev/null || true
+            cmd_credit_guard 2>/dev/null || true
+            _caffeinate_sync 2>/dev/null || true
         fi
-        cmd_credit_guard 2>/dev/null || true
-        _caffeinate_sync 2>/dev/null || true
     fi
     _write_cache "$warn" 2>/dev/null || true
 }
@@ -701,7 +731,9 @@ cmd_menu() {
 
     args+=("" "" "")   # separator
 
-    # Freshen the limited table so the list reflects current state.
+    # Freshen the limited table so the list reflects current state: reconcile
+    # (prune dead panes, run due retries) unconditionally, then scan for new limits.
+    cmd_sweep 2>/dev/null || true
     [[ "${ENABLED:-off}" == "on" ]] && { cmd_scan 2>/dev/null || true; }
 
     local found=0 nowm sid type target next st proj eta rel d label
@@ -810,6 +842,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         usage)       cmd_usage_fetch >/dev/null && _usage_lines "$USAGE_JSON" ;;
         goto)        cmd_goto "${2:-}" ;;
         scan)        cmd_scan ;;
+        sweep)       cmd_sweep ;;
         credit-guard) cmd_credit_guard ;;
         options)     cmd_options ;;
         toggle)      cmd_toggle "${2:-}" ;;

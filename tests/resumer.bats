@@ -272,6 +272,29 @@ teardown() {
     [ "$output" = "resumed" ]
 }
 
+@test "sweep: prunes rows for dead/empty panes, keeps live ones" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=off   # prune runs even when disabled; no retries fire
+    tmux() { case "$*" in "list-panes -a -F #{pane_id}") printf '%s\n' "%1";; *) : ;; esac; }
+    sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,status) VALUES
+        ('live','%1','credit-guard','','waiting'),
+        ('dead','%9','credit-guard','','waiting'),
+        ('nopane','','usage','/tmp/x','waiting');"
+    cmd_sweep
+    run sqlite3 "$DB" "SELECT session_id FROM limited ORDER BY session_id;"
+    [ "$output" = "live" ]
+}
+
+@test "sweep: with no live panes at all, clears everything" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=off
+    tmux() { case "$*" in "list-panes -a -F #{pane_id}") printf '';; *) : ;; esac; }
+    sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,status) VALUES ('a','%1','credit-guard','','waiting'),('b','%2','usage','/tmp/x','retrying');"
+    cmd_sweep
+    run sqlite3 "$DB" "SELECT COUNT(*) FROM limited WHERE status IN ('waiting','retrying');"
+    [ "$output" = "0" ]
+}
+
 @test "retry no-ops (no typing) when disabled" {
     bash "$SCRIPT" init >/dev/null
     sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,status) VALUES ('s','%1','usage','/tmp/x','waiting');"
