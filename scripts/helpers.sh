@@ -66,6 +66,7 @@ CREDIT_THRESHOLD=""
 INTERRUPT_ESCAPES=""
 CREDIT_NOTICE=""
 RESUME_JITTER=""
+INTERRUPT_PAUSE=""
 VIM_MODE=""
 DEBUG_LOG=""
 
@@ -112,12 +113,15 @@ load_config() {
     CREDIT_THRESHOLD=$(get_tmux_option "@agent-resumer-credit-threshold" "100")
     # How many Escapes to send to interrupt a turn (1 = plain interrupt; >1 risks
     # opening Claude's rewind menu - verify on a live pane before raising).
-    INTERRUPT_ESCAPES=$(get_tmux_option "@agent-resumer-interrupt-escapes" "1")
+    INTERRUPT_ESCAPES=$(get_tmux_option "@agent-resumer-interrupt-escapes" "3")
     # Notice typed into the paused pane's input box (not submitted).
     CREDIT_NOTICE=$(get_tmux_option "@agent-resumer-credit-notice" "[Credit usage disabled - enable in resumer options]")
     # Seconds of random jitter added to each scheduled retry so a global reset does
     # not release every paused agent simultaneously.
     RESUME_JITTER=$(get_tmux_option "@agent-resumer-resume-jitter" "30")
+    # Seconds to wait after an interrupt Escape before typing, so the Escape lands
+    # as a standalone interrupt instead of merging with the next key into a sequence.
+    INTERRUPT_PAUSE=$(get_tmux_option "@agent-resumer-interrupt-pause" "1")
     # Claude Code vim-mode input: auto (detect from pane), on, or off. In vim mode
     # text must be typed in insert state or it is eaten as normal-mode commands.
     VIM_MODE=$(get_tmux_option "@agent-resumer-vim-mode" "auto")
@@ -145,6 +149,7 @@ CREDIT_THRESHOLD='$CREDIT_THRESHOLD'
 INTERRUPT_ESCAPES='$INTERRUPT_ESCAPES'
 CREDIT_NOTICE='$CREDIT_NOTICE'
 RESUME_JITTER='$RESUME_JITTER'
+INTERRUPT_PAUSE='$INTERRUPT_PAUSE'
 VIM_MODE='$VIM_MODE'
 DEBUG_LOG='$DEBUG_LOG'
 EOF

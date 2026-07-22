@@ -271,6 +271,29 @@ _type_prompt() {
     tmux send-keys -t "$pane" -l "$text" 2>/dev/null || true   # -l = literal, no key-name parsing
 }
 
+# Is the pane mid-turn? Info-only heuristic (Claude shows "…tokens…"/"thinking"
+# while generating). Used for display, NOT to gate the interrupt - the detector is
+# too unreliable to decide whether to fire.
+_pane_busy() {
+    tmux capture-pane -t "$1" -p 2>/dev/null | grep -qiE 'tokens|thinking|esc to interrupt' 2>/dev/null
+}
+
+# Interrupt a running turn: fire Escape INTERRUPT_ESCAPES times, each spaced by
+# INTERRUPT_PAUSE. Spacing is essential: a rapid double-Escape opens Claude's rewind
+# menu, and an Escape immediately followed by another key merges into an escape
+# sequence so the interrupt never registers (observed: agent kept running). Fires
+# unconditionally ("fire again to stop"); extra Escapes on an already-idle pane are
+# harmless (spaced single Escapes just toggle vim mode).
+_interrupt_pane() {
+    local pane="$1" tries="${INTERRUPT_ESCAPES:-3}" pause="${INTERRUPT_PAUSE:-1}" i
+    for (( i=1; i<=tries; i++ )); do
+        tmux send-keys -t "$pane" Escape 2>/dev/null || true
+        sleep "$pause"
+    done
+    _debug_log "interrupt $pane: fired $tries Escape(s) spaced ${pause}s"
+    _pane_busy "$pane" && return 1 || return 0
+}
+
 # Keep the Mac awake while any agent is paused, so the scheduled resume timer
 # survives idle sleep (Claude's own caffeinate lapses once the agent stalls).
 # Holds ONE continuous `caffeinate -i` for the whole wait (no 15-min gaps) and
@@ -487,7 +510,7 @@ _credits_pct()  { _num_field "$USAGE_JSON" "spend.percent"; }
 # a free resume at the session reset. Only reached on a fresh crossing into max.
 _credit_guard_interrupt() {
     [[ -f "$TRACKER_DB" ]] || return 0
-    local reset_secs now delay sid target pane st n=0 esc="${INTERRUPT_ESCAPES:-1}" i vim
+    local reset_secs now delay sid target pane st n=0 vim
     reset_secs=$(_seconds_until_session_reset 2>/dev/null || echo 0)
     now=$(date +%s)
     delay=$(( ${reset_secs:-0} + 15 )); [[ "$delay" -lt 60 ]] && delay=300
@@ -496,7 +519,7 @@ _credit_guard_interrupt() {
         st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
         [[ "$st" == "waiting" || "$st" == "retrying" ]] && continue   # already handled
         vim=0; _pane_is_vim "$pane" && vim=1                          # detect BEFORE escaping
-        i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
+        _interrupt_pane "$pane" || true                               # spaced retries (nonzero = still busy; tolerate under set -e)
         # Escape already sent (escaped=1) so _prep_input won't send a second one.
         [[ -n "${CREDIT_NOTICE:-}" ]] && _type_prompt "$pane" "$CREDIT_NOTICE" 1 "$vim"   # typed, NOT submitted
         sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
@@ -957,13 +980,13 @@ cmd_selftest() {
         tmux list-panes -a -F '  #{pane_id}  #{session_name}:#{window_index}.#{pane_index}  #{pane_current_command}' 2>/dev/null
         return 1
     fi
-    local rp="${RESUME_PROMPT:-resume}" esc="${INTERRUPT_ESCAPES:-1}" i vim=0
+    local rp="${RESUME_PROMPT:-resume}" vim=0
     # Detect vim BEFORE the Escape (normal mode shows no indicator to detect later).
     _pane_is_vim "$pane" && { vim=1; echo "(vim-mode input detected)"; } || echo "(non-vim input)"
+    _pane_busy "$pane" && echo "(pane looks BUSY - a turn is running)" || echo "(pane looks idle - Escape has nothing to interrupt)"
     echo "=== pane $pane BEFORE (last 4 lines) ==="; tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
-    echo "=== sending Escape x$esc (should interrupt a running turn) ==="
-    i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
-    sleep 1
+    echo "=== interrupting (Escape x up to ${INTERRUPT_ESCAPES:-3}, spaced ${INTERRUPT_PAUSE:-1}s) ==="
+    _interrupt_pane "$pane" && echo "(no longer busy)" || echo "(STILL busy - interrupt did not stop it)"
     tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     echo "=== typing '$rp' into the input box (not submitted) ==="
     _type_prompt "$pane" "$rp" 1 "$vim"     # Escape already sent; pass detected vim state

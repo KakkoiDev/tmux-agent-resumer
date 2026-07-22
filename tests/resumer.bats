@@ -193,7 +193,7 @@ teardown() {
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_target TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg1','s:1.9','%9','','claude','working');"
     sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',50);"  # prev below threshold -> crossing
     SENT="$TMPD/sent"; : > "$SENT"
-    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    tmux() { case "$*" in *capture-pane*) echo "Simmering… (5s · ↓ 1.2k tokens · thinking…)" ;; *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
     grep -q "send-keys -t %9 Escape" "$SENT"
     run sqlite3 "$DB" "SELECT limit_type||':'||status FROM limited WHERE session_id='cg1';"
@@ -209,7 +209,7 @@ teardown() {
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg2','%9','','claude','working');"
     sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',100);"  # already maxed -> NO crossing
     SENT="$TMPD/sent"; : > "$SENT"
-    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    tmux() { case "$*" in *capture-pane*) echo "Simmering… (5s · ↓ 1.2k tokens · thinking…)" ;; *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
     [ ! -s "$SENT" ]
     run sqlite3 "$DB" "SELECT COUNT(*) FROM limited;"
@@ -225,7 +225,7 @@ teardown() {
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('x','%9','','claude','working');"
     # NO guard_state row -> this is a first arm. Must seed baseline, not fire.
     SENT="$TMPD/sent"; : > "$SENT"
-    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    tmux() { case "$*" in *capture-pane*) echo "Simmering… (5s · ↓ 1.2k tokens · thinking…)" ;; *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
     [ ! -s "$SENT" ]                                              # no Escape sent
     run sqlite3 "$DB" "SELECT COUNT(*) FROM limited;"
@@ -244,7 +244,7 @@ teardown() {
         INSERT INTO sessions VALUES('work','s:1.1','%1','','claude','working'),('idle','s:1.2','%2','','claude','idle');"
     sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',50);"
     SENT="$TMPD/sent"; : > "$SENT"
-    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    tmux() { case "$*" in *capture-pane*) echo "Simmering… (5s · ↓ 1.2k tokens · thinking…)" ;; *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
     grep -q "%1 Escape" "$SENT"        # working -> interrupted
     ! grep -q "%2" "$SENT"             # idle -> untouched
@@ -261,7 +261,7 @@ teardown() {
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg3','%9','','claude','working');"
     sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',50);"
     SENT="$TMPD/sent"; : > "$SENT"
-    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    tmux() { case "$*" in *capture-pane*) echo "Simmering… (5s · ↓ 1.2k tokens · thinking…)" ;; *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
     [ ! -s "$SENT" ]
     run sqlite3 "$DB" "SELECT COUNT(*) FROM limited;"
