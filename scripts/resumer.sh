@@ -35,6 +35,18 @@ TRACKER_DB="${TRACKER_DB:-$HOME/.tmux-agent-tracker/tracker.db}"
 sql() { printf '.timeout 100\n%s\n' "$*" | sqlite3 "$DB"; }
 sql_esc() { local q="'"; printf '%s' "${1//$q/$q$q}"; }
 
+# Atomic mkdir lock (macOS has no flock). Returns 0 if acquired. Steals a lock
+# older than 120s so a killed holder can't deadlock. _unlock releases it.
+_try_lock() {
+    local d="$RESUMER_DIR/.lock.$1"
+    mkdir -p "$RESUMER_DIR" 2>/dev/null || true
+    if mkdir "$d" 2>/dev/null; then return 0; fi
+    local age; age=$(( $(date +%s) - $(_file_mtime "$d" 2>/dev/null || echo 0) ))
+    if [[ "$age" -ge 120 ]]; then rmdir "$d" 2>/dev/null || true; mkdir "$d" 2>/dev/null && return 0; fi
+    return 1
+}
+_unlock() { rmdir "$RESUMER_DIR/.lock.$1" 2>/dev/null || true; }
+
 _debug_log() {
     [[ "${DEBUG_LOG:-1}" == "1" ]] || return 0
     mkdir -p "$RESUMER_DIR"
@@ -63,8 +75,10 @@ _json_val() {
 
 _load_config_fast() {
     [[ -n "${ENABLED:-}" ]] && return 0
-    local _cc="$RESUMER_DIR/config_cache"
-    if [[ -f "$_cc" ]]; then source "$_cc"; else load_config 2>/dev/null || true; fi
+    # Delegate to load_config so the 60s staleness check is honored and the cache
+    # is rewritten when stale - otherwise a direct `tmux set @agent-resumer-*`
+    # would never propagate (the cache was sourced unconditionally, forever).
+    load_config 2>/dev/null || true
 }
 
 # ── pure detection logic (unit-tested; no side effects) ───────────────
@@ -131,6 +145,10 @@ CREATE TABLE IF NOT EXISTS limited (
     detected_at     INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at      INTEGER NOT NULL DEFAULT (unixepoch())
 );
+CREATE TABLE IF NOT EXISTS guard_state (
+    k TEXT PRIMARY KEY,
+    v REAL
+);
 SQL
     echo "Initialized: $DB"
 }
@@ -183,20 +201,32 @@ cmd_hook() {
 
 # ── resume state machine (#3) - gated behind @agent-resumer-enabled ───
 
-# Seconds until the 5-hour session window resets, from the cached usage JSON.
-# Lets a usage-limit resume be scheduled at the real reset instead of blind polling.
-_seconds_until_session_reset() {
+# Seconds until a given usage window resets, from the cached usage JSON.
+# $1 = window key (five_hour | seven_day). Lets a usage-limit resume be scheduled
+# at the REAL reset instead of blind polling, and against the CORRECT window so a
+# weekly limit is not retried on the 5-hour cadence (and exhausted before it lifts).
+_seconds_until_reset() {
+    local key="${1:-five_hour}"
     [[ -f "$USAGE_JSON" ]] || return 1
-    python3 - "$USAGE_JSON" <<'PY' 2>/dev/null || true
+    python3 - "$USAGE_JSON" "$key" <<'PY' 2>/dev/null || true
 import json,sys,datetime
 try: d=json.load(open(sys.argv[1]))
 except Exception: sys.exit(0)
-r=(d.get("five_hour") or {}).get("resets_at")
+r=(d.get(sys.argv[2]) or {}).get("resets_at")
 if not r: sys.exit(0)
 try: t=datetime.datetime.fromisoformat(r.replace("Z","+00:00"))
 except Exception: sys.exit(0)
 print(max(int((t-datetime.datetime.now(datetime.timezone.utc)).total_seconds()),0))
 PY
+}
+_seconds_until_session_reset() { _seconds_until_reset five_hour; }
+
+# Pick the usage window (five_hour|seven_day) implied by a limit message.
+_reset_window_for_text() {
+    case "$1" in
+        *"weekly limit"*|*"Opus limit"*|*"Sonnet limit"*|*"Fable 5 limit"*) echo "seven_day" ;;
+        *) echo "five_hour" ;;
+    esac
 }
 
 _schedule_retry() {
@@ -212,6 +242,9 @@ _schedule_retry() {
 _caffeinate_sync() {
     _load_config_fast
     [[ "${CAFFEINATE:-on}" == "on" ]] || return 0
+    # Serialize the check-spawn-record sequence so two concurrent syncs can't both
+    # spawn a caffeinate (leaking an unrecorded one). If busy, another sync has it.
+    _try_lock caffeinate || return 0
     local pidf="$RESUMER_DIR/caffeinate.pid" n running="" p
     n=$(sql "SELECT COUNT(*) FROM limited WHERE status IN ('waiting','retrying');" 2>/dev/null || echo 0)
     if [[ -f "$pidf" ]]; then
@@ -233,6 +266,7 @@ _caffeinate_sync() {
         rm -f "$pidf"
         _debug_log "caffeinate off - no paused agents"
     fi
+    _unlock caffeinate
 }
 
 # Record a limited session and schedule its first retry. No-op if already active.
@@ -240,9 +274,6 @@ _enqueue_limited() {
     local sid="$1" target="$2" pane="$3" type="$4" tp="$5"
     _load_config_fast
     [[ -f "$DB" ]] || cmd_init >/dev/null 2>&1
-    local st
-    st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
-    [[ "$st" == "waiting" || "$st" == "retrying" ]] && return 0
     [[ -z "$target" && -n "$pane" ]] && target=$(tmux display-message -t "$pane" \
         -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
 
@@ -250,16 +281,31 @@ _enqueue_limited() {
     [[ "$type" == "spend" ]] && floor="${SPEND_BACKOFF_FLOOR:-1800}"
     local delay="$floor"
     if [[ "$type" == "usage" ]]; then
-        local rs; rs=$(_seconds_until_session_reset 2>/dev/null || true)
+        # Schedule the first retry at the reset of the CORRECT window (weekly limits
+        # reset on the 7-day clock, not the 5-hour one).
+        local win rs mtext=""
+        [[ -n "$tp" ]] && mtext=$(_json_val "$(_detect_limit_line "$tp" 2>/dev/null || true)" "text")
+        win=$(_reset_window_for_text "$mtext")
+        rs=$(_seconds_until_reset "$win" 2>/dev/null || true)
         [[ -n "$rs" && "$rs" -gt 0 ]] 2>/dev/null && delay=$(( rs + 15 ))
     fi
     local now; now=$(date +%s)
     local rp="${RESUME_PROMPT:-resume}"
-    sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
-         INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
-             resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)
-         VALUES ('$(sql_esc "$sid")','$(sql_esc "$pane")','$(sql_esc "$target")','$(sql_esc "$type")',
-             '$(sql_esc "$tp")','$(sql_esc "$rp")',0,$floor,$((now+delay)),'waiting',$now,$now);"
+    local esid; esid=$(sql_esc "$sid")
+    # Atomic claim: insert (or replace a stale 'resumed' row) ONLY if no active or
+    # gaveup row exists for this session, then report changes() from the SAME
+    # connection. Prevents two concurrent callers both scheduling a timer (double
+    # 'resume'), and stops cmd_scan resurrecting a 'gaveup' row past the retry cap.
+    local claimed
+    claimed=$(sql "INSERT OR REPLACE INTO limited
+             (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
+              resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)
+         SELECT '$esid','$(sql_esc "$pane")','$(sql_esc "$target")','$(sql_esc "$type")',
+             '$(sql_esc "$tp")','$(sql_esc "$rp")',0,$floor,$((now+delay)),'waiting',$now,$now
+         WHERE NOT EXISTS (SELECT 1 FROM limited
+             WHERE session_id='$esid' AND status IN ('waiting','retrying','gaveup'));
+         SELECT changes();")
+    [[ "$claimed" == "1" ]] || return 0
     _debug_log "enqueue sid=$sid type=$type pane=$pane first-retry=${delay}s"
     _notify "resumer: agent hit ${type} limit (pane ${pane:-?}). Waiting; will auto-resume at reset."
     _schedule_retry "$sid" "$delay"
@@ -305,8 +351,10 @@ cmd_retry() {
     if [[ "$viewing" == "1" ]]; then
         local psess last_act idle grace
         psess=$(tmux display-message -t "$pane" -p '#{session_name}' 2>/dev/null || true)
-        last_act=$(tmux list-clients -F '#{client_session} #{client_activity}' 2>/dev/null \
-            | awk -v s="$psess" '$1==s {print $2}' | sort -n | tail -1)
+        # Filter by the WHOLE session name server-side (a name may contain spaces,
+        # which an awk field-split would break, silently failing the guard open).
+        last_act=$(tmux list-clients -f "#{==:#{client_session},$psess}" \
+            -F '#{client_activity}' 2>/dev/null | sort -n | tail -1)
         grace="${IDLE_GRACE:-60}"
         if [[ -n "$last_act" ]]; then
             idle=$(( now - last_act ))
@@ -363,7 +411,7 @@ cmd_scan() {
     [[ -f "$TRACKER_DB" ]] || return 0
     [[ -f "$DB" ]] || cmd_init >/dev/null 2>&1
     local sid target pane tp line type
-    while IFS='|' read -r sid target pane; do
+    while IFS=$'\x1f' read -r sid target pane; do
         [[ -z "$sid" ]] && continue
         tp=$(_transcript_for "$sid")
         [[ -z "$tp" ]] && continue
@@ -371,7 +419,7 @@ cmd_scan() {
             type=$(_classify_limit "$(_json_val "$line" "text")")
             _enqueue_limited "$sid" "$target" "$pane" "$type" "$tp"
         fi
-    done < <(sqlite3 -separator '|' "$TRACKER_DB" \
+    done < <(sqlite3 -separator $'\x1f' "$TRACKER_DB" \
         "SELECT session_id, COALESCE(tmux_target,''), COALESCE(tmux_pane,'')
          FROM sessions WHERE COALESCE(agent_type,'')='' AND COALESCE(agent_client,'claude')='claude';" 2>/dev/null)
 }
@@ -403,7 +451,7 @@ _credit_guard_interrupt() {
     reset_secs=$(_seconds_until_session_reset 2>/dev/null || echo 0)
     now=$(date +%s)
     delay=$(( ${reset_secs:-0} + 15 )); [[ "$delay" -lt 60 ]] && delay=300
-    while IFS='|' read -r sid target pane; do
+    while IFS=$'\x1f' read -r sid target pane; do
         [[ -z "$sid" || -z "$pane" ]] && continue
         st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
         [[ "$st" == "waiting" || "$st" == "retrying" ]] && continue   # already handled
@@ -416,7 +464,7 @@ _credit_guard_interrupt() {
                  'resume',0,$delay,$((now+delay)),'waiting',$now,$now);"
         _schedule_retry "$sid" "$delay"
         n=$((n+1))
-    done < <(sqlite3 -separator '|' "$TRACKER_DB" \
+    done < <(sqlite3 -separator $'\x1f' "$TRACKER_DB" \
         "SELECT session_id, COALESCE(tmux_target,''), COALESCE(tmux_pane,'')
          FROM sessions WHERE COALESCE(agent_type,'')='' AND COALESCE(agent_client,'claude')='claude'
            AND status='working';" 2>/dev/null)
@@ -426,30 +474,41 @@ _credit_guard_interrupt() {
 }
 
 # Detect a fresh crossing into session-max and, unless credits are allowed,
-# interrupt to avoid paid spend. Crossing-only (tracks last util) so it never
-# nukes an already-maxed session the instant it's armed.
+# interrupt to avoid paid spend. The baseline lives in guard_state (SQLite), and
+# the crossing is claimed atomically so:
+#   - the FIRST arm against an already-maxed session is NOT a false crossing
+#     (baseline is seeded to current and we return);
+#   - two concurrent refreshes cannot both interrupt (only one UPDATE claims it).
 cmd_credit_guard() {
     _load_config_fast
     [[ "${ENABLED:-off}" == "on" ]] || return 0
+    [[ -f "$DB" ]] || return 0
     [[ -f "$USAGE_JSON" ]] || return 0
-    local thr cur curi sf prev previ
+    local thr cur seeded
     thr="${CREDIT_THRESHOLD:-100}"
     cur=$(_session_util); [[ -z "$cur" ]] && return 0
-    sf="$RESUMER_DIR/.session_util"; prev=0
-    [[ -f "$sf" ]] && prev=$(cat "$sf" 2>/dev/null || echo 0)
-    printf '%s' "$cur" > "$sf"
-    curi=${cur%.*}; previ=${prev%.*}
-    # Allowing credits? then no guard (but still tracked util above).
-    [[ "${ALLOW_CREDITS:-off}" == "on" ]] && return 0
-    if [[ "${curi:-0}" -ge "$thr" && "${previ:-0}" -lt "$thr" ]]; then
-        local cp cpi; cp=$(_credits_pct); cpi=${cp%.*}
-        if [[ "${cpi:-0}" -ge 100 ]]; then
-            _debug_log "credit-guard: session maxed, credits exhausted - nothing to block"
-            _notify "resumer: session maxed and \$0 credits left - just wait for reset."
-            return 0
-        fi
-        _credit_guard_interrupt
+    # First arm: no baseline yet -> seed and return (never a crossing).
+    seeded=$(sql "INSERT INTO guard_state (k,v) SELECT 'session_util',$cur
+                  WHERE NOT EXISTS (SELECT 1 FROM guard_state WHERE k='session_util');
+                  SELECT changes();" 2>/dev/null || echo 0)
+    [[ "$seeded" == "1" ]] && { _debug_log "credit-guard: baseline seeded at ${cur}% (no crossing)"; return 0; }
+    # Atomically claim an upward crossing (prev<thr && cur>=thr): only one caller wins.
+    local crossed
+    crossed=$(sql "UPDATE guard_state SET v=$cur
+                   WHERE k='session_util' AND v < $thr AND $cur >= $thr;
+                   SELECT changes();" 2>/dev/null || echo 0)
+    # Always keep the baseline current for the next comparison (idempotent).
+    sql "UPDATE guard_state SET v=$cur WHERE k='session_util';" 2>/dev/null || true
+    [[ "$crossed" == "1" ]] || return 0
+    # Allowing credits (emergency mode)? then don't interrupt.
+    [[ "${ALLOW_CREDITS:-off}" == "on" ]] && { _debug_log "credit-guard: crossing but ALLOW_CREDITS on"; return 0; }
+    local cp cpi; cp=$(_credits_pct); cpi=${cp%.*}
+    if [[ "${cpi:-0}" -ge 100 ]]; then
+        _debug_log "credit-guard: session maxed, credits exhausted - nothing to block"
+        _notify "resumer: session maxed and \$0 credits left - just wait for reset."
+        return 0
     fi
+    _credit_guard_interrupt
 }
 
 # ── status bar render ─────────────────────────────────────────────────
@@ -534,7 +593,8 @@ def u(o):
     except Exception: return 0.0
 sp=d.get("spend") or {}
 usd=(sp.get("used") or {})
-used=usd.get("amount_minor",0)/10**int(usd.get("exponent",2) or 2)
+_e=usd.get("exponent"); _e=2 if _e is None else int(_e)
+used=usd.get("amount_minor",0)/10**_e
 print(f"{u(d.get('five_hour'))},{u(d.get('seven_day'))},{sp.get('percent',0)},{used:.2f}")
 PY
 )
@@ -581,11 +641,12 @@ cmd_refresh() {
     _load_config_fast
     local warn="" uf
     if uf=$(cmd_usage_fetch 2>/dev/null); then warn=$(_usage_warn "$uf"); _usage_log "$uf"; fi
-    # Throttled: reconcile stale/due rows + scan for new limits + guard + caffeinate.
+    # Throttled + locked: only ONE client's refresh does the work per interval
+    # (many attached clients each call refresh on the same status-interval tick).
     local stamp="$RESUMER_DIR/.last_scan" now last=0
     now=$(date +%s)
     [[ -f "$stamp" ]] && last=$(_file_mtime "$stamp" 2>/dev/null || echo 0)
-    if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]]; then
+    if [[ $((now - last)) -ge "$SCAN_INTERVAL" ]] && _try_lock refresh; then
         touch "$stamp"
         cmd_sweep 2>/dev/null || true            # prune dead panes + run due retries (also when disabled)
         if [[ "${ENABLED:-off}" == "on" ]]; then
@@ -593,6 +654,7 @@ cmd_refresh() {
             cmd_credit_guard 2>/dev/null || true
             _caffeinate_sync 2>/dev/null || true
         fi
+        _unlock refresh
     fi
     _write_cache "$warn" 2>/dev/null || true
 }
@@ -625,20 +687,22 @@ cmd_usage_fetch() {
     fi
 
     # 1) live endpoint with the keychain OAuth token
-    local raw tok status
+    local raw tok status tmpf
     raw=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)
     if [[ -n "$raw" ]]; then
         tok=$(printf '%s' "$raw" | python3 -c 'import json,sys;print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])' 2>/dev/null || true)
         if [[ -n "$tok" ]]; then
-            status=$(curl -sS -m 10 -o "$USAGE_JSON.tmp" -w '%{http_code}' \
+            # Unique temp per fetch so concurrent writers never share a buffer.
+            tmpf=$(mktemp "$USAGE_JSON.XXXXXX" 2>/dev/null || echo "$USAGE_JSON.tmp.$$")
+            status=$(curl -sS -m 10 -o "$tmpf" -w '%{http_code}' \
                 -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
                 "$USAGE_URL" 2>/dev/null || echo 000)
             if [[ "$status" == "200" ]]; then
-                mv -f "$USAGE_JSON.tmp" "$USAGE_JSON"
+                mv -f "$tmpf" "$USAGE_JSON"
                 _debug_log "usage fetched via endpoint (200)"
                 printf '%s' "$USAGE_JSON"; return 0
             fi
-            rm -f "$USAGE_JSON.tmp" 2>/dev/null || true
+            rm -f "$tmpf" 2>/dev/null || true
             _debug_log "usage endpoint failed status=$status (token expired? falling back)"
         fi
     fi
@@ -697,7 +761,9 @@ for l in d.get("limits",[]) or []:
 sp=d.get("spend") or {}
 if sp and sp.get("enabled"):
     u=sp.get("used") or {}; li=sp.get("limit") or {}
-    ue=10**int(u.get("exponent",2) or 2); le=10**int(li.get("exponent",2) or 2)
+    _ue=u.get("exponent"); _ue=2 if _ue is None else int(_ue)
+    _le=li.get("exponent"); _le=2 if _le is None else int(_le)
+    ue=10**_ue; le=10**_le
     cur=u.get("currency","")
     out.append(f"Credits  {pct(sp.get('percent',0))}%   ({u.get('amount_minor',0)/ue:.2f}/{li.get('amount_minor',0)/le:.2f} {cur})")
 for x in out: print(x)
@@ -738,7 +804,8 @@ cmd_menu() {
 
     local found=0 nowm sid type target next st proj eta rel d label
     nowm=$(date +%s)
-    while IFS='|' read -r sid type target next st; do
+    # char(31) delimiter: session/target names may contain '|'.
+    while IFS=$'\x1f' read -r sid type target next st; do
         [[ -z "$sid" ]] && continue
         found=$((found+1))
         proj=""
@@ -755,12 +822,16 @@ cmd_menu() {
             [[ -n "$eta" ]] && label="${label} resume ~${eta} (${rel})"
         fi
         [[ "$st" == "retrying" ]] && label="${label} [retrying]"
+        label="${label//#/}"   # strip '#' so tmux does not format-expand the label
         if [[ -n "$target" ]]; then
-            args+=("$label" "" "run-shell '$SCRIPTS_DIR/resumer.sh goto ${target}'")
+            # Pass the session_id (UUID / %pane - no quotes/spaces), not the target,
+            # so a session name with a quote/space/# can't break the command string.
+            # cmd_goto resolves the target from the DB by session_id.
+            args+=("$label" "" "run-shell '$SCRIPTS_DIR/resumer.sh goto $sid'")
         else
             args+=("$label (no pane)" "" "")
         fi
-    done < <(sql "SELECT session_id||'|'||limit_type||'|'||COALESCE(tmux_target,'')||'|'||COALESCE(next_retry_at,0)||'|'||status
+    done < <(sql "SELECT session_id||char(31)||limit_type||char(31)||COALESCE(tmux_target,'')||char(31)||COALESCE(next_retry_at,0)||char(31)||status
                   FROM limited WHERE status IN ('waiting','retrying') ORDER BY COALESCE(next_retry_at,0);" 2>/dev/null)
     [[ "$found" -eq 0 ]] && args+=("No paused agents" "" "")
 
@@ -815,14 +886,19 @@ cmd_options() {
     tmux display-menu "${args[@]}"
 }
 
-# Jump to a pane. Target is 'session:window.pane'. Same moves as the tracker.
+# Jump to a pane. Arg is a session_id (resolved to its target via the DB) or,
+# for back-compat, a literal 'session:window.pane' target.
 cmd_goto() {
-    local target="${1:?Usage: resumer.sh goto <session:window.pane>}"
+    local arg="${1:?Usage: resumer.sh goto <session_id|session:window.pane>}"
+    local target=""
+    [[ -f "$DB" ]] && target=$(sql "SELECT tmux_target FROM limited WHERE session_id='$(sql_esc "$arg")' LIMIT 1;" 2>/dev/null || true)
+    [[ -z "$target" ]] && target="$arg"    # literal target fallback
+    [[ -z "$target" ]] && return 0
     local sess="${target%%:*}" win="${target%.*}"
     tmux switch-client -t "$sess" 2>/dev/null || true
     tmux select-window -t "$win" 2>/dev/null || true
     tmux select-pane -t "$target" 2>/dev/null || true
-    _debug_log "goto target=$target"
+    _debug_log "goto arg=$arg target=$target"
 }
 
 # ── main ──────────────────────────────────────────────────────────────

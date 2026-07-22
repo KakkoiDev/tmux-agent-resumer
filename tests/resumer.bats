@@ -190,7 +190,7 @@ teardown() {
     printf '%s' '{"five_hour":{"utilization":100,"resets_at":"2030-01-01T00:00:00Z"},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
     export TRACKER_DB="$TMPD/tracker.db"
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_target TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg1','s:1.9','%9','','claude','working');"
-    printf '50' > "$RESUMER_DIR/.session_util"      # prev below threshold -> crossing
+    sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',50);"  # prev below threshold -> crossing
     SENT="$TMPD/sent"; : > "$SENT"
     tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
@@ -206,13 +206,31 @@ teardown() {
     printf '%s' '{"five_hour":{"utilization":100},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
     export TRACKER_DB="$TMPD/tracker.db"
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg2','%9','','claude','working');"
-    printf '100' > "$RESUMER_DIR/.session_util"     # already maxed -> NO crossing
+    sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',100);"  # already maxed -> NO crossing
     SENT="$TMPD/sent"; : > "$SENT"
     tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
     [ ! -s "$SENT" ]
     run sqlite3 "$DB" "SELECT COUNT(*) FROM limited;"
     [ "$output" = "0" ]
+}
+
+@test "credit-guard: first arm against an already-maxed session does NOT interrupt (regression #1)" {
+    bash "$SCRIPT" init >/dev/null
+    ENABLED=on ALLOW_CREDITS=off CREDIT_THRESHOLD=100 NTFY_TOPIC="" CAFFEINATE=off
+    export USAGE_JSON="$TMPD/u.json"
+    printf '%s' '{"five_hour":{"utilization":100},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
+    export TRACKER_DB="$TMPD/tracker.db"
+    sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('x','%9','','claude','working');"
+    # NO guard_state row -> this is a first arm. Must seed baseline, not fire.
+    SENT="$TMPD/sent"; : > "$SENT"
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    cmd_credit_guard
+    [ ! -s "$SENT" ]                                              # no Escape sent
+    run sqlite3 "$DB" "SELECT COUNT(*) FROM limited;"
+    [ "$output" = "0" ]
+    run sqlite3 "$DB" "SELECT CAST(v AS INT) FROM guard_state WHERE k='session_util';"
+    [ "$output" = "100" ]                                        # baseline seeded
 }
 
 @test "credit-guard: only interrupts working agents, not idle ones" {
@@ -223,7 +241,7 @@ teardown() {
     export TRACKER_DB="$TMPD/tracker.db"
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_target TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT);
         INSERT INTO sessions VALUES('work','s:1.1','%1','','claude','working'),('idle','s:1.2','%2','','claude','idle');"
-    printf '50' > "$RESUMER_DIR/.session_util"
+    sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',50);"
     SENT="$TMPD/sent"; : > "$SENT"
     tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard
@@ -240,7 +258,7 @@ teardown() {
     printf '%s' '{"five_hour":{"utilization":100},"spend":{"enabled":true,"percent":15}}' > "$USAGE_JSON"
     export TRACKER_DB="$TMPD/tracker.db"
     sqlite3 "$TRACKER_DB" "CREATE TABLE sessions(session_id TEXT,tmux_pane TEXT,agent_type TEXT,agent_client TEXT,status TEXT); INSERT INTO sessions VALUES('cg3','%9','','claude','working');"
-    printf '50' > "$RESUMER_DIR/.session_util"
+    sqlite3 "$DB" "INSERT INTO guard_state(k,v) VALUES('session_util',50);"
     SENT="$TMPD/sent"; : > "$SENT"
     tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
     cmd_credit_guard

@@ -23,16 +23,19 @@ _link_if_stale() {
 }
 _link_if_stale "$CURRENT_DIR/bin/tmux-agent-resumer" "$HOME/.local/bin/tmux-agent-resumer"
 
-# <prefix>+R : usage + paused-agents modal
+# <prefix>+R : usage + paused-agents modal. Single-quote the path so a plugin dir
+# containing spaces survives the /bin/sh word-split inside run-shell.
 RESUMER_KEY=$(get_tmux_option "@agent-resumer-key" "R")
-tmux bind-key "$RESUMER_KEY" run-shell "$SCRIPTS_DIR/resumer.sh menu"
+tmux bind-key "$RESUMER_KEY" run-shell "'$SCRIPTS_DIR/resumer.sh' menu"
 
 tmux set -gq @agent-resumer-status ""
 
-# Inject status segment if not already present. Coexists with the tracker's
-# segment (distinct @agent-resumer-status option).
+# Inject the status segment. The periodic ENGINE is the #(...refresh) runner, so
+# key the decision on the runner specifically - not on the badge option - so we
+# re-inject if a status-right rewrite dropped the runner but left the badge.
+# Quote the path for spaces.
+runner="#('$SCRIPTS_DIR/resumer.sh' refresh)"
 current_status_right=$(tmux show-option -gqv status-right)
-if [[ "$current_status_right" != *"@agent-resumer-status"* && "$current_status_right" != *"resumer.sh"* ]]; then
-    status_cmd="#{@agent-resumer-status}#($SCRIPTS_DIR/resumer.sh refresh)"
-    tmux set -g status-right "${status_cmd} ${current_status_right}"
+if [[ "$current_status_right" != *"resumer.sh' refresh"* && "$current_status_right" != *"resumer.sh refresh"* ]]; then
+    tmux set -g status-right "#{@agent-resumer-status}${runner} ${current_status_right}"
 fi
