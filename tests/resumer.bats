@@ -335,6 +335,17 @@ teardown() {
     grep -q "send-keys -t %9 -l note" "$SENT"
 }
 
+@test "type_prompt: explicit vim flag beats detection (normal mode shows no indicator after Escape)" {
+    SENT="$TMPD/sent"; : > "$SENT"
+    VIM_MODE=auto   # auto-detect would FAIL post-Escape (normal mode has no indicator)
+    # tmux capture returns nothing (simulating normal mode) -> detection says non-vim
+    tmux() { case "$*" in *capture-pane*) : ;; *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    _type_prompt "%9" "resume" 1 1   # caller passes isvim=1 (detected before its Escape)
+    grep -q "send-keys -t %9 A" "$SENT"          # honored the passed flag
+    grep -q "send-keys -t %9 -l resume" "$SENT"
+    ! grep -q "send-keys -t %9 Escape" "$SENT"   # escaped=1 -> no second Escape
+}
+
 @test "type_prompt: non-vim sends only literal, no Escape/A" {
     SENT="$TMPD/sent"; : > "$SENT"
     VIM_MODE=off

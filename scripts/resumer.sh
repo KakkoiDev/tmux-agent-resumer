@@ -251,19 +251,23 @@ _pane_is_vim() {
 
 # Put a pane's input into insert state so literal text types as text (not as vim
 # normal-mode commands). $2=1 means an Escape was ALREADY sent (don't send another
-# - two Escapes open Claude's rewind menu).
+# - two Escapes open Claude's rewind menu). $3 = known vim state (1/0); pass it
+# because vim NORMAL mode shows no indicator, so detection AFTER an Escape fails -
+# the caller must detect BEFORE escaping.
 _prep_input() {
-    local pane="$1" escaped="${2:-0}"
-    if _pane_is_vim "$pane"; then
+    local pane="$1" escaped="${2:-0}" isvim="${3:-}"
+    [[ -z "$isvim" ]] && { if _pane_is_vim "$pane"; then isvim=1; else isvim=0; fi; }
+    if [[ "$isvim" == "1" ]]; then
         [[ "$escaped" == "1" ]] || tmux send-keys -t "$pane" Escape 2>/dev/null || true
         tmux send-keys -t "$pane" A 2>/dev/null || true   # append at end -> insert
     fi
 }
 
-# Type literal text into a pane's input (mode-safe). $3=1 -> input already escaped.
+# Type literal text into a pane's input (mode-safe). $3=1 -> already escaped.
+# $4 = known vim state (1/0); pass it when an Escape precedes this call.
 _type_prompt() {
-    local pane="$1" text="$2" escaped="${3:-0}"
-    _prep_input "$pane" "$escaped"
+    local pane="$1" text="$2" escaped="${3:-0}" isvim="${4:-}"
+    _prep_input "$pane" "$escaped" "$isvim"
     tmux send-keys -t "$pane" -l "$text" 2>/dev/null || true   # -l = literal, no key-name parsing
 }
 
@@ -483,7 +487,7 @@ _credits_pct()  { _num_field "$USAGE_JSON" "spend.percent"; }
 # a free resume at the session reset. Only reached on a fresh crossing into max.
 _credit_guard_interrupt() {
     [[ -f "$TRACKER_DB" ]] || return 0
-    local reset_secs now delay sid target pane st n=0 esc="${INTERRUPT_ESCAPES:-1}" i
+    local reset_secs now delay sid target pane st n=0 esc="${INTERRUPT_ESCAPES:-1}" i vim
     reset_secs=$(_seconds_until_session_reset 2>/dev/null || echo 0)
     now=$(date +%s)
     delay=$(( ${reset_secs:-0} + 15 )); [[ "$delay" -lt 60 ]] && delay=300
@@ -491,9 +495,10 @@ _credit_guard_interrupt() {
         [[ -z "$sid" || -z "$pane" ]] && continue
         st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
         [[ "$st" == "waiting" || "$st" == "retrying" ]] && continue   # already handled
+        vim=0; _pane_is_vim "$pane" && vim=1                          # detect BEFORE escaping
         i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
         # Escape already sent (escaped=1) so _prep_input won't send a second one.
-        [[ -n "${CREDIT_NOTICE:-}" ]] && _type_prompt "$pane" "$CREDIT_NOTICE" 1   # typed, NOT submitted
+        [[ -n "${CREDIT_NOTICE:-}" ]] && _type_prompt "$pane" "$CREDIT_NOTICE" 1 "$vim"   # typed, NOT submitted
         sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
              INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
                  resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)
@@ -952,15 +957,16 @@ cmd_selftest() {
         tmux list-panes -a -F '  #{pane_id}  #{session_name}:#{window_index}.#{pane_index}  #{pane_current_command}' 2>/dev/null
         return 1
     fi
-    local rp="${RESUME_PROMPT:-resume}" esc="${INTERRUPT_ESCAPES:-1}" i
-    _pane_is_vim "$pane" && echo "(vim-mode input detected)" || echo "(non-vim input)"
+    local rp="${RESUME_PROMPT:-resume}" esc="${INTERRUPT_ESCAPES:-1}" i vim=0
+    # Detect vim BEFORE the Escape (normal mode shows no indicator to detect later).
+    _pane_is_vim "$pane" && { vim=1; echo "(vim-mode input detected)"; } || echo "(non-vim input)"
     echo "=== pane $pane BEFORE (last 4 lines) ==="; tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     echo "=== sending Escape x$esc (should interrupt a running turn) ==="
     i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
     sleep 1
     tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     echo "=== typing '$rp' into the input box (not submitted) ==="
-    _type_prompt "$pane" "$rp" 1     # Escape already sent above
+    _type_prompt "$pane" "$rp" 1 "$vim"     # Escape already sent; pass detected vim state
     sleep 1
     tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     if [[ "$submit" == "--submit" ]]; then
