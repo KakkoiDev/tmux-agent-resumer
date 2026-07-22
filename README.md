@@ -55,31 +55,48 @@ Persist across tmux restarts - add to `~/.tmux.conf`:
 run-shell /path/to/tmux-agent-resumer/agent-resumer.tmux
 ```
 
-## Verification gate (before enabling auto-resume)
-1. Install. Open `<prefix>+R` - confirm your usage shows.
-2. On the next real limit hit, check `~/.tmux-agent-resumer/debug.log` for a `DETECTED 429`
-   line (proves the Stop/StopFailure hook fires) and note the pane state.
-3. Confirm `resume`+Enter is what the post-429 TUI needs to continue (adjust
-   `@agent-resumer-resume-prompt` if not). Then set `@agent-resumer-enabled on`.
+## Verify it works
+- `tmux-agent-resumer doctor` - checks deps, keychain/token, usage endpoint, DB,
+  hooks, status segment, and prints current config. Run this first.
+- `tmux-agent-resumer selftest <pane>` - sends `Escape` then types the resume prompt
+  into a REAL (non-limited) Claude pane and shows before/after captures, so you can
+  confirm the interrupt/resume keystrokes actually drive the TUI. Non-destructive
+  (clears the input; add `--submit` to actually send). Find the pane with
+  `tmux list-panes -a`. Do NOT target the pane you're typing in.
 
-## Test
+Then, before enabling auto-resume: on the next real limit hit, check
+`~/.tmux-agent-resumer/debug.log` for `DETECTED 429`, then `tmux set -g @agent-resumer-enabled on`.
+
+## Test / CI
 ```
 bats tests/resumer.bats
+shellcheck -S warning scripts/*.sh
 ```
+GitHub Actions runs both on every push (`.github/workflows/ci.yml`).
+
+## Commands
+`doctor`, `selftest <pane> [--submit]`, `menu` (<prefix>+R), `usage`, `refresh`,
+`sweep`, `scan`, `cleanup`, `toggle <enabled|caffeinate|allow-credits>`, `options`.
 
 ## Config (tmux options)
-`@agent-resumer-enabled` (off), `@agent-resumer-key` (R),
-`@agent-resumer-resume-prompt` (resume),
+`@agent-resumer-enabled` (off), `@agent-resumer-allow-credits` (off),
+`@agent-resumer-key` (R), `@agent-resumer-resume-prompt` (resume),
 `@agent-resumer-warn-session` (90), `@agent-resumer-warn-weekly` (90),
 `@agent-resumer-warn-credits` (80), `@agent-resumer-idle-grace` (60),
-`@agent-resumer-caffeinate` (on),
+`@agent-resumer-caffeinate` (on), `@agent-resumer-ntfy-topic` (""),
+`@agent-resumer-credit-threshold` (100), `@agent-resumer-interrupt-escapes` (1),
+`@agent-resumer-credit-notice` (...), `@agent-resumer-resume-jitter` (30),
 `@agent-resumer-usage-backoff-floor` (120), `@agent-resumer-spend-backoff-floor` (1800),
 `@agent-resumer-backoff-cap` (3600), `@agent-resumer-usage-retry-cap` (12),
 `@agent-resumer-spend-retry-cap` (48), `@agent-resumer-debug-log` (1).
 
 ## Honest unknowns
 - Whether `Stop`/`StopFailure` fires on a 429 is unconfirmed - the hook-driven trigger
-  depends on it. A hook-independent periodic scan (`cmd_scan` via `refresh`) is the fallback.
-- Whether `resume`+Enter is the exact keystroke the post-429 TUI needs is unconfirmed.
-- The send-keys mechanism itself is verified (keystrokes reach the target pane).
+  depends on it. A hook-independent periodic scan (`cmd_sweep`/`cmd_scan` via `refresh`,
+  which also self-heals after a tmux restart) is the fallback.
+- Whether `resume`+Enter and `Escape` are the exact keystrokes the post-429 TUI needs is
+  unconfirmed against a live limit - run `selftest` to check. The send-keys mechanism
+  itself is verified (keystrokes reach the target pane).
+- The credit-guard interrupt cannot truly PREVENT spend (detection lags the switch);
+  it minimizes it. It also interrupts in-flight turns - real blast radius.
 - Spend-cap retries are mostly futile within a billing month; expect give-up + a badge there.

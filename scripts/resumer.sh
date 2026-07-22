@@ -231,6 +231,12 @@ _reset_window_for_text() {
 
 _schedule_retry() {
     local sid="$1" delay="$2"
+    # Jitter so N agents released by the same account-global reset don't all fire
+    # at once and re-trigger the limit. 0..RESUME_JITTER seconds added.
+    local jmax="${RESUME_JITTER:-30}"
+    if [[ "${jmax:-0}" -gt 0 ]] 2>/dev/null; then
+        delay=$(( delay + RANDOM % (jmax + 1) ))
+    fi
     tmux run-shell -b "sleep $delay && $SCRIPTS_DIR/resumer.sh retry $sid" 2>/dev/null || true
 }
 
@@ -901,6 +907,67 @@ cmd_goto() {
     _debug_log "goto arg=$arg target=$target"
 }
 
+# Verify the core keystroke assumption against a REAL (non-limited) Claude pane:
+# does Escape interrupt, and does the resume prompt land in the input box? Shows
+# before/after pane captures. Non-destructive: types the prompt then clears it
+# (C-u), never submits, unless --submit is passed.
+cmd_selftest() {
+    local pane="${1:?Usage: resumer.sh selftest <pane-id> [--submit]}" submit="${2:-}"
+    _load_config_fast
+    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane" \
+        || { echo "pane $pane not found (run 'tmux list-panes -a' to find your Claude pane)"; return 1; }
+    local rp="${RESUME_PROMPT:-resume}" esc="${INTERRUPT_ESCAPES:-1}" i
+    echo "=== pane $pane BEFORE (last 4 lines) ==="; tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
+    echo "=== sending Escape x$esc (should interrupt a running turn) ==="
+    i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
+    sleep 1
+    tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
+    echo "=== typing '$rp' into the input box (not submitted) ==="
+    tmux send-keys -t "$pane" "$rp" 2>/dev/null || true
+    sleep 1
+    tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
+    if [[ "$submit" == "--submit" ]]; then
+        echo "=== submitting (Enter) ==="; tmux send-keys -t "$pane" Enter 2>/dev/null || true
+    else
+        echo "=== clearing input (C-u) - not submitted ==="; tmux send-keys -t "$pane" C-u 2>/dev/null || true
+    fi
+    echo "REVIEW: did Escape interrupt the turn, and did '$rp' appear in the input box?"
+    echo "If not, adjust @agent-resumer-resume-prompt / @agent-resumer-interrupt-escapes."
+}
+
+# Health check: surface silent failure modes (missing deps, token, hooks, etc).
+cmd_doctor() {
+    _load_config_fast
+    local pass=0 fail=0
+    _ck() { if eval "$2" >/dev/null 2>&1; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1"; fail=$((fail+1)); fi; }
+    echo "tmux-agent-resumer doctor"
+    echo "- dependencies"
+    _ck "sqlite3 present"  "command -v sqlite3"
+    _ck "python3 present"  "command -v python3"
+    _ck "curl present"     "command -v curl"
+    _ck "security present" "command -v security"
+    _ck "tmux 3.0+"        "check_tmux_version 3.0"
+    echo "- usage data"
+    _ck "keychain item readable"  "security find-generic-password -s '$KEYCHAIN_SERVICE' -w"
+    local tok; tok=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["claudeAiOauth"]["accessToken"])' 2>/dev/null || true)
+    _ck "oauth token parses"      "[ -n '$tok' ]"
+    if [[ -n "$tok" ]]; then
+        local code; code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" -H "Content-Type: application/json" "$USAGE_URL" 2>/dev/null || echo 000)
+        _ck "usage endpoint 200 (got $code)" "[ '$code' = 200 ]"
+    fi
+    echo "- state / integration"
+    _ck "resumer DB present"          "[ -f '$DB' ]"
+    _ck "limited table"               "sqlite3 '$DB' \"SELECT 1 FROM sqlite_master WHERE name='limited'\" | grep -q 1"
+    _ck "guard_state table"           "sqlite3 '$DB' \"SELECT 1 FROM sqlite_master WHERE name='guard_state'\" | grep -q 1"
+    _ck "tracker DB present"          "[ -f '$TRACKER_DB' ]"
+    _ck "Stop/StopFailure hooks set"  "grep -q tmux-agent-resumer '$HOME/.claude/settings.json'"
+    _ck "status segment injected"     "tmux show-option -gqv status-right | grep -q '@agent-resumer-status'"
+    echo "- config"
+    echo "  enabled=$(get_tmux_option @agent-resumer-enabled off)  allow-credits=$(get_tmux_option @agent-resumer-allow-credits off)  caffeinate=$(get_tmux_option @agent-resumer-caffeinate on)  ntfy=$(get_tmux_option @agent-resumer-ntfy-topic '(off)')"
+    echo "result: $pass ok, $fail fail"
+    [[ "$fail" -eq 0 ]]
+}
+
 # ── main ──────────────────────────────────────────────────────────────
 # Guard so tests can `source` this file and exercise the pure functions
 # without tripping the dispatcher.
@@ -922,7 +989,9 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         credit-guard) cmd_credit_guard ;;
         options)     cmd_options ;;
         toggle)      cmd_toggle "${2:-}" ;;
-        *) echo "Usage: resumer.sh {init|hook <event>|detect-file <path>|retry <sid>|status-bar|refresh|cleanup|menu|usage|goto <target>|scan|options|toggle <name>}" >&2
+        selftest)    cmd_selftest "${2:-}" "${3:-}" ;;
+        doctor)      cmd_doctor ;;
+        *) echo "Usage: resumer.sh {init|hook <event>|detect-file <path>|retry <sid>|status-bar|refresh|cleanup|menu|usage|goto <target>|scan|sweep|credit-guard|options|toggle <name>|selftest <pane> [--submit]|doctor}" >&2
            exit 1 ;;
     esac
 fi

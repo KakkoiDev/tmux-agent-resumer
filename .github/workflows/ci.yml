@@ -1,0 +1,18 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bats + shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats shellcheck sqlite3
+      - name: shellcheck
+        run: shellcheck -S warning scripts/resumer.sh scripts/helpers.sh install.sh uninstall.sh agent-resumer.tmux bin/tmux-agent-resumer
+      - name: bats
+        run: bats tests/resumer.bats

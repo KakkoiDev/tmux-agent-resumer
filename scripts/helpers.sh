@@ -6,6 +6,7 @@
 if [[ -z "${AGENT_RESUMER_PLUGIN_DIR:-}" ]]; then
     AGENT_RESUMER_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
+# shellcheck disable=SC2034  # used by callers that source this file
 SCRIPTS_DIR="$AGENT_RESUMER_PLUGIN_DIR/scripts"
 
 # ── platform helpers ──────────────────────────────────────────────────
@@ -64,6 +65,7 @@ ALLOW_CREDITS=""
 CREDIT_THRESHOLD=""
 INTERRUPT_ESCAPES=""
 CREDIT_NOTICE=""
+RESUME_JITTER=""
 DEBUG_LOG=""
 
 load_config() {
@@ -73,6 +75,7 @@ load_config() {
         now=$(date +%s)
         age=$(( now - $(_file_mtime "$cache" 2>/dev/null || echo 0) ))
         if [[ "$age" -lt 60 ]]; then
+            # shellcheck disable=SC1090  # runtime-generated cache path
             source "$cache"
             return
         fi
@@ -111,6 +114,9 @@ load_config() {
     INTERRUPT_ESCAPES=$(get_tmux_option "@agent-resumer-interrupt-escapes" "1")
     # Notice typed into the paused pane's input box (not submitted).
     CREDIT_NOTICE=$(get_tmux_option "@agent-resumer-credit-notice" "[Credit usage disabled - enable in resumer options]")
+    # Seconds of random jitter added to each scheduled retry so a global reset does
+    # not release every paused agent simultaneously.
+    RESUME_JITTER=$(get_tmux_option "@agent-resumer-resume-jitter" "30")
     DEBUG_LOG=$(get_tmux_option "@agent-resumer-debug-log" "1")
 
     cat > "${cache}.tmp" <<EOF
@@ -134,6 +140,7 @@ ALLOW_CREDITS='$ALLOW_CREDITS'
 CREDIT_THRESHOLD='$CREDIT_THRESHOLD'
 INTERRUPT_ESCAPES='$INTERRUPT_ESCAPES'
 CREDIT_NOTICE='$CREDIT_NOTICE'
+RESUME_JITTER='$RESUME_JITTER'
 DEBUG_LOG='$DEBUG_LOG'
 EOF
     mv -f "${cache}.tmp" "$cache"
