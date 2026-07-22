@@ -505,9 +505,10 @@ _session_util() { _num_field "$USAGE_JSON" "five_hour.utilization"; }
 _credits_pct()  { _num_field "$USAGE_JSON" "spend.percent"; }
 
 # Interrupt only WORKING claude agents (those mid-turn = actually spending
-# credits); idle/finished panes spend nothing and are left alone. Sends Escape
-# to stop the turn, types the notice into the box (no Enter), enqueues each for
-# a free resume at the session reset. Only reached on a fresh crossing into max.
+# credits); idle/finished panes spend nothing and are left alone. Escapes to stop
+# the turn, types the notice (no Enter), enqueues each for a free resume at reset.
+# Debounced: agents that already have a waiting/retrying limited row are skipped,
+# so the continuous guard does not re-Escape a paused agent every tick.
 _credit_guard_interrupt() {
     [[ -f "$TRACKER_DB" ]] || return 0
     local reset_secs now delay sid target pane st n=0 vim
@@ -538,39 +539,28 @@ _credit_guard_interrupt() {
     _caffeinate_sync
 }
 
-# Detect a fresh crossing into session-max and, unless credits are allowed,
-# interrupt to avoid paid spend. The baseline lives in guard_state (SQLite), and
-# the crossing is claimed atomically so:
-#   - the FIRST arm against an already-maxed session is NOT a false crossing
-#     (baseline is seeded to current and we return);
-#   - two concurrent refreshes cannot both interrupt (only one UPDATE claims it).
+# CONTINUOUS guard: whenever the session window is at/over the threshold and
+# credits are not allowed, interrupt EVERY working agent that isn't already paused.
+# Not crossing-based - it also blocks a session that was already maxed and still
+# spending (the crossing-only version let those sail through). Per-agent debounce
+# lives in _credit_guard_interrupt (it skips agents that already have a limited row),
+# so a paused agent is not re-Escaped every tick.
 cmd_credit_guard() {
     _load_config_fast
     [[ "${ENABLED:-off}" == "on" ]] || return 0
     [[ -f "$DB" ]] || return 0
     [[ -f "$USAGE_JSON" ]] || return 0
-    local thr cur seeded
+    # Emergency mode: user opted to allow paid credits -> don't block.
+    [[ "${ALLOW_CREDITS:-off}" == "on" ]] && return 0
+    local thr cur curi cp cpi
     thr="${CREDIT_THRESHOLD:-100}"
     cur=$(_session_util); [[ -z "$cur" ]] && return 0
-    # First arm: no baseline yet -> seed and return (never a crossing).
-    seeded=$(sql "INSERT INTO guard_state (k,v) SELECT 'session_util',$cur
-                  WHERE NOT EXISTS (SELECT 1 FROM guard_state WHERE k='session_util');
-                  SELECT changes();" 2>/dev/null || echo 0)
-    [[ "$seeded" == "1" ]] && { _debug_log "credit-guard: baseline seeded at ${cur}% (no crossing)"; return 0; }
-    # Atomically claim an upward crossing (prev<thr && cur>=thr): only one caller wins.
-    local crossed
-    crossed=$(sql "UPDATE guard_state SET v=$cur
-                   WHERE k='session_util' AND v < $thr AND $cur >= $thr;
-                   SELECT changes();" 2>/dev/null || echo 0)
-    # Always keep the baseline current for the next comparison (idempotent).
-    sql "UPDATE guard_state SET v=$cur WHERE k='session_util';" 2>/dev/null || true
-    [[ "$crossed" == "1" ]] || return 0
-    # Allowing credits (emergency mode)? then don't interrupt.
-    [[ "${ALLOW_CREDITS:-off}" == "on" ]] && { _debug_log "credit-guard: crossing but ALLOW_CREDITS on"; return 0; }
-    local cp cpi; cp=$(_credits_pct); cpi=${cp%.*}
+    curi=${cur%.*}
+    [[ "${curi:-0}" -ge "$thr" ]] || return 0        # under threshold -> nothing to block
+    cp=$(_credits_pct); cpi=${cp%.*}
     if [[ "${cpi:-0}" -ge 100 ]]; then
-        _debug_log "credit-guard: session maxed, credits exhausted - nothing to block"
-        _notify "resumer: session maxed and \$0 credits left - just wait for reset."
+        # Credits already exhausted: you're hard-blocked regardless; no point Escaping.
+        _debug_log "credit-guard: session maxed, \$0 credits left - nothing to block"
         return 0
     fi
     _credit_guard_interrupt
