@@ -163,7 +163,8 @@ teardown() {
     sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,resume_prompt,retry_count,backoff_secs,next_retry_at,status) VALUES ('it','%9','s:1.9','usage','$TP','resume',0,120,$(date +%s),'waiting');"
 
     cmd_retry it                                     # still limited -> should send resume
-    grep -q "send-keys -t %9 resume Enter" "$SENT"
+    grep -q "send-keys -t %9 -l resume" "$SENT"   # literal text
+    grep -q "send-keys -t %9 Enter" "$SENT"        # submitted
     run sqlite3 "$DB" "SELECT status||':'||retry_count FROM limited WHERE session_id='it';"
     [ "$output" = "retrying:1" ]
 
@@ -285,7 +286,8 @@ teardown() {
     _has_agent_child() { return 0; }
     sqlite3 "$DB" "INSERT INTO limited (session_id,tmux_pane,limit_type,transcript_path,resume_prompt,retry_count,backoff_secs,next_retry_at,status) VALUES ('cgr','%9','credit-guard','','resume',0,120,$(date +%s),'waiting');"
     cmd_retry cgr
-    grep -q "send-keys -t %9 resume Enter" "$SENT"
+    grep -q "send-keys -t %9 -l resume" "$SENT"   # literal text
+    grep -q "send-keys -t %9 Enter" "$SENT"        # submitted
     run sqlite3 "$DB" "SELECT status FROM limited WHERE session_id='cgr';"
     [ "$output" = "resumed" ]
 }
@@ -311,6 +313,36 @@ teardown() {
     cmd_sweep
     run sqlite3 "$DB" "SELECT COUNT(*) FROM limited WHERE status IN ('waiting','retrying');"
     [ "$output" = "0" ]
+}
+
+@test "type_prompt: vim mode enters insert (A) and sends literal (regression: resume->ume)" {
+    SENT="$TMPD/sent"; : > "$SENT"
+    VIM_MODE=on
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    _type_prompt "%9" "resume"
+    grep -q "send-keys -t %9 Escape" "$SENT"     # normalize to normal mode
+    grep -q "send-keys -t %9 A" "$SENT"          # enter insert at end
+    grep -q "send-keys -t %9 -l resume" "$SENT"  # literal text (not eaten)
+}
+
+@test "type_prompt: vim mode with escaped=1 does NOT send a second Escape (rewind guard)" {
+    SENT="$TMPD/sent"; : > "$SENT"
+    VIM_MODE=on
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    _type_prompt "%9" "note" 1
+    ! grep -q "send-keys -t %9 Escape" "$SENT"   # caller already escaped; no double-escape
+    grep -q "send-keys -t %9 A" "$SENT"
+    grep -q "send-keys -t %9 -l note" "$SENT"
+}
+
+@test "type_prompt: non-vim sends only literal, no Escape/A" {
+    SENT="$TMPD/sent"; : > "$SENT"
+    VIM_MODE=off
+    tmux() { case "$*" in *send-keys*) printf '%s\n' "$*" >> "$SENT" ;; *) : ;; esac; }
+    _type_prompt "%9" "resume"
+    ! grep -q "Escape" "$SENT"
+    ! grep -qE "send-keys -t %9 A$" "$SENT"
+    grep -q "send-keys -t %9 -l resume" "$SENT"
 }
 
 @test "retry no-ops (no typing) when disabled" {

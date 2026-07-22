@@ -240,6 +240,33 @@ _schedule_retry() {
     tmux run-shell -b "sleep $delay && $SCRIPTS_DIR/resumer.sh retry $sid" 2>/dev/null || true
 }
 
+# Is the pane's input in Claude Code vim mode? auto = detect the mode indicator.
+_pane_is_vim() {
+    case "${VIM_MODE:-auto}" in
+        on)  return 0 ;;
+        off) return 1 ;;
+        *)   tmux capture-pane -t "$1" -p 2>/dev/null | grep -qE -- '-- (INSERT|NORMAL) --' ;;
+    esac
+}
+
+# Put a pane's input into insert state so literal text types as text (not as vim
+# normal-mode commands). $2=1 means an Escape was ALREADY sent (don't send another
+# - two Escapes open Claude's rewind menu).
+_prep_input() {
+    local pane="$1" escaped="${2:-0}"
+    if _pane_is_vim "$pane"; then
+        [[ "$escaped" == "1" ]] || tmux send-keys -t "$pane" Escape 2>/dev/null || true
+        tmux send-keys -t "$pane" A 2>/dev/null || true   # append at end -> insert
+    fi
+}
+
+# Type literal text into a pane's input (mode-safe). $3=1 -> input already escaped.
+_type_prompt() {
+    local pane="$1" text="$2" escaped="${3:-0}"
+    _prep_input "$pane" "$escaped"
+    tmux send-keys -t "$pane" -l "$text" 2>/dev/null || true   # -l = literal, no key-name parsing
+}
+
 # Keep the Mac awake while any agent is paused, so the scheduled resume timer
 # survives idle sleep (Claude's own caffeinate lapses once the agent stalls).
 # Holds ONE continuous `caffeinate -i` for the whole wait (no 15-min gaps) and
@@ -375,8 +402,10 @@ cmd_retry() {
     if [[ "$type" == "credit-guard" ]]; then
         local su sui; su=$(_session_util); sui=${su%.*}
         if [[ -n "$su" && "${sui:-100}" -lt "${CREDIT_THRESHOLD:-100}" ]]; then
+            _prep_input "$pane"                                     # insert state (vim-safe)
             tmux send-keys -t "$pane" C-u 2>/dev/null || true       # clear the typed notice
-            tmux send-keys -t "$pane" "$rp" Enter 2>/dev/null || true
+            _type_prompt "$pane" "$rp" 1                            # already in insert
+            tmux send-keys -t "$pane" Enter 2>/dev/null || true
             sql "UPDATE limited SET status='resumed',updated_at=$now WHERE session_id='$(sql_esc "$sid")';"
             _debug_log "credit-guard RESUME sid=$sid (session back to ${su}%)"
             _notify "resumer: session reset - resumed agent (pane ${pane})."; return 0
@@ -401,8 +430,9 @@ cmd_retry() {
     # Type the resume prompt into the pane. This only RE-ISSUES the request; the
     # API still enforces the limit - if the window is still closed it 429s again
     # and we back off; once it has reset, the turn continues. No bypass, just the
-    # keypress you would make yourself.
-    tmux send-keys -t "$pane" "$rp" Enter 2>/dev/null || true
+    # keypress you would make yourself. Mode-safe (vim input types text, not commands).
+    _type_prompt "$pane" "$rp"
+    tmux send-keys -t "$pane" Enter 2>/dev/null || true
     local nb; nb=$(_next_backoff "$backoff" "$type")
     sql "UPDATE limited SET status='retrying',retry_count=$((rc+1)),backoff_secs=$nb,next_retry_at=$((now+nb)),updated_at=$now
          WHERE session_id='$(sql_esc "$sid")';"
@@ -462,7 +492,8 @@ _credit_guard_interrupt() {
         st=$(sql "SELECT status FROM limited WHERE session_id='$(sql_esc "$sid")';" 2>/dev/null || true)
         [[ "$st" == "waiting" || "$st" == "retrying" ]] && continue   # already handled
         i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
-        [[ -n "${CREDIT_NOTICE:-}" ]] && tmux send-keys -t "$pane" "$CREDIT_NOTICE" 2>/dev/null || true  # typed, NOT submitted
+        # Escape already sent (escaped=1) so _prep_input won't send a second one.
+        [[ -n "${CREDIT_NOTICE:-}" ]] && _type_prompt "$pane" "$CREDIT_NOTICE" 1   # typed, NOT submitted
         sql "DELETE FROM limited WHERE session_id='$(sql_esc "$sid")';
              INSERT INTO limited (session_id,tmux_pane,tmux_target,limit_type,transcript_path,
                  resume_prompt,retry_count,backoff_secs,next_retry_at,status,detected_at,updated_at)
@@ -922,13 +953,14 @@ cmd_selftest() {
         return 1
     fi
     local rp="${RESUME_PROMPT:-resume}" esc="${INTERRUPT_ESCAPES:-1}" i
+    _pane_is_vim "$pane" && echo "(vim-mode input detected)" || echo "(non-vim input)"
     echo "=== pane $pane BEFORE (last 4 lines) ==="; tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     echo "=== sending Escape x$esc (should interrupt a running turn) ==="
     i=0; while [[ "$i" -lt "$esc" ]]; do tmux send-keys -t "$pane" Escape 2>/dev/null || true; i=$((i+1)); done
     sleep 1
     tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     echo "=== typing '$rp' into the input box (not submitted) ==="
-    tmux send-keys -t "$pane" "$rp" 2>/dev/null || true
+    _type_prompt "$pane" "$rp" 1     # Escape already sent above
     sleep 1
     tmux capture-pane -t "$pane" -p 2>/dev/null | grep . | tail -4
     if [[ "$submit" == "--submit" ]]; then
@@ -936,8 +968,8 @@ cmd_selftest() {
     else
         echo "=== clearing input (C-u) - not submitted ==="; tmux send-keys -t "$pane" C-u 2>/dev/null || true
     fi
-    echo "REVIEW: did Escape interrupt the turn, and did '$rp' appear in the input box?"
-    echo "If not, adjust @agent-resumer-resume-prompt / @agent-resumer-interrupt-escapes."
+    echo "REVIEW: did Escape interrupt the turn, and did '$rp' appear (whole) in the input box?"
+    echo "If not, adjust @agent-resumer-vim-mode / -resume-prompt / -interrupt-escapes."
 }
 
 # Health check: surface silent failure modes (missing deps, token, hooks, etc).

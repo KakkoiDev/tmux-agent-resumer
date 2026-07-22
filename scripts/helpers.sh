@@ -66,6 +66,7 @@ CREDIT_THRESHOLD=""
 INTERRUPT_ESCAPES=""
 CREDIT_NOTICE=""
 RESUME_JITTER=""
+VIM_MODE=""
 DEBUG_LOG=""
 
 load_config() {
@@ -117,6 +118,9 @@ load_config() {
     # Seconds of random jitter added to each scheduled retry so a global reset does
     # not release every paused agent simultaneously.
     RESUME_JITTER=$(get_tmux_option "@agent-resumer-resume-jitter" "30")
+    # Claude Code vim-mode input: auto (detect from pane), on, or off. In vim mode
+    # text must be typed in insert state or it is eaten as normal-mode commands.
+    VIM_MODE=$(get_tmux_option "@agent-resumer-vim-mode" "auto")
     DEBUG_LOG=$(get_tmux_option "@agent-resumer-debug-log" "1")
 
     cat > "${cache}.tmp" <<EOF
@@ -141,6 +145,7 @@ CREDIT_THRESHOLD='$CREDIT_THRESHOLD'
 INTERRUPT_ESCAPES='$INTERRUPT_ESCAPES'
 CREDIT_NOTICE='$CREDIT_NOTICE'
 RESUME_JITTER='$RESUME_JITTER'
+VIM_MODE='$VIM_MODE'
 DEBUG_LOG='$DEBUG_LOG'
 EOF
     mv -f "${cache}.tmp" "$cache"
