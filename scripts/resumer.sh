@@ -624,6 +624,13 @@ _write_cache() {
     printf '%s' "$final" > "$CACHE.tmp" 2>/dev/null || true
     mv -f "$CACHE.tmp" "$CACHE" 2>/dev/null || true
     tmux set -gq @agent-resumer-status "$final" 2>/dev/null || true
+    # Push the redraw. Setting the option alone only becomes visible on tmux's
+    # own status cadence, which is status-interval seconds away (15 by default,
+    # and this plugin does not lower it). So a CREDIT BLOCKED badge could sit
+    # invisible for 15s after the guard fired. tmux-agent-tracker already does
+    # this at each of its render sites; the resumer had no refresh-client call
+    # anywhere in the repo.
+    tmux refresh-client -S 2>/dev/null || true
 }
 
 # Badge warnings (accurate, no free/paid editorializing - session-max DOES spill
