@@ -30,20 +30,46 @@ _file_mtime() {
 # session was marked gaveup. Both are destined for the shared lib/identity.sh.
 _AGENT_COMMS="claude codex gemini deer deerbox pi agy antigravity"
 
-# _has_agent_child <shell_pid> - is an agent harness a direct child of this pid?
+# _has_agent_child <pane_pid> - is an agent harness this pid, or a direct child?
 #
-# One `ps -eo ppid,comm | awk` for both platforms, not a Darwin/Linux fork.
-# `ps -eo ppid,comm` is POSIX and verified to print a bare command name on this
-# platform ("claude", not a path), so exact-match works everywhere and there is
-# no second branch left to drift.
+# One `ps | awk` for both platforms, not a Darwin/Linux fork.
 #
 # `comm`, never `pane_current_command`: Claude Code rewrites argv[0] to its own
 # version string, so tmux reports the pane's command as e.g. "2.1.220".
+#
+# Two things the ppid-only, exact-match version got wrong. Both measured here:
+#
+#   * It matched `$1 == p` where $1 is ppid, so it could only ever find a CHILD.
+#     A pane whose OWN process is the harness has no agent child, and that is
+#     exactly the shape `tmux-agent-mesh dispatch` creates - its own test is
+#     "dispatch runs the harness as the pane's own process". Every dispatched
+#     agent was therefore invisible: the tracker's _reap_dead deleted its row
+#     with reason=no_agent, and the resumer marked it "gaveup: no live agent".
+#   * `ps -eo comm` prints the executable *as invoked*, not its basename. A bare
+#     PATH invocation gives `claude`, but an absolute one gives
+#     `/opt/homebrew/bin/claude`, which never equalled "claude". The old comment
+#     asserted a bare name was verified on this platform; that only held for the
+#     PATH case.
+#
+# The command is taken as the rest of the line rather than as field 3, because a
+# comm can contain spaces: this machine has
+# `/Applications/Claude.app/.../Claude Helper (Renderer)` running right now.
+#
+# Named _has_agent_child rather than _pane_has_agent because ~20 test bodies stub
+# it by that name; renaming it in production without them would leave those stubs
+# silently inert. Rename when it moves into lib/identity.sh, stubs and all.
 _has_agent_child() {
-    local shell_pid="$1"
-    ps -eo ppid,comm 2>/dev/null | awk -v p="$shell_pid" -v names="$_AGENT_COMMS" '
+    local pid="$1"
+    [[ -n "$pid" ]] || return 1
+    ps -eo pid,ppid,comm 2>/dev/null | awk -v p="$pid" -v names="$_AGENT_COMMS" '
         BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-        $1 == p && ($2 in want) { found = 1; exit }
+        NR == 1 { next }
+        {
+            cmd = $0
+            sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", cmd)
+            sub(/.*\//, "", cmd)
+            if (($1 == p || $2 == p) && (cmd in want)) { found = 1; exit }
+        }
         END { exit !found }
     '
 }
