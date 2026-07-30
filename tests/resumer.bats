@@ -384,3 +384,41 @@ teardown() {
     run sqlite3 "$DB" "SELECT status||':'||retry_count FROM limited WHERE session_id='s';"
     [ "$output" = "waiting:0" ]
 }
+
+# ── lock (lib/lock.sh via _try_lock/_unlock) ──────────────────────────
+#
+# The mkdir lock the OS never releases when the holder dies. The version these
+# replaced stole only after a flat 120s, so a killed credit-guard or caffeinate
+# holder blocked the next one for two minutes.
+#
+# Run against the pre-change implementation to see which of these are load-bearing:
+# only "a dead holder is stolen immediately" fails there. The other two pass on both,
+# and are here to pin the behaviour the swap must not lose - a lock that steals too
+# eagerly is a worse bug than one that steals too late.
+
+@test "lock: acquired when free, refused while held" {
+    _try_lock probe
+    refute _try_lock probe
+    _unlock probe
+    _try_lock probe
+}
+
+@test "lock: a dead holder is stolen immediately, not after 120s" {
+    local d="$RESUMER_DIR/.lock.probe"
+    mkdir -p "$d"
+    # A pid that has exited. `wait` reaps it, so the kernel cannot be holding it
+    # as a zombie that kill -0 would still see.
+    bash -c 'exit 0' & local dead=$!
+    wait "$dead" 2>/dev/null || true
+    printf '%s\n' "$dead" > "$d/pid"
+    _try_lock probe
+    assert_eq "$(cat "$d/pid")" "$$"
+}
+
+@test "lock: a live holder is never stolen" {
+    local d="$RESUMER_DIR/.lock.probe"
+    mkdir -p "$d"
+    printf '%s\n' "$$" > "$d/pid"
+    refute _try_lock probe
+    assert_eq "$(cat "$d/pid")" "$$"
+}

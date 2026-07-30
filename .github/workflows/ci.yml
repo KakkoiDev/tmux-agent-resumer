@@ -14,5 +14,20 @@ jobs:
           sudo apt-get install -y bats shellcheck sqlite3
       - name: shellcheck
         run: shellcheck -S warning scripts/resumer.sh scripts/helpers.sh install.sh uninstall.sh agent-resumer.tmux bin/tmux-agent-resumer
+      # lib/ is vendored from KakkoiDev/tmux-toolkit via git subtree. Editing it
+      # in place here is how five plugins accumulated 26 duplicated helpers in
+      # the first place, so a drifted copy fails the build. Fix it upstream and
+      # run `make fanout` in the toolkit.
+      - name: lib/ has not drifted from its tagged source
+        run: |
+          have=$(find lib -name '*.sh' | sort | xargs shasum | shasum | cut -d' ' -f1)
+          want=$(cat lib/.checksum)
+          if [ "$have" != "$want" ]; then
+            echo "lib/ has drifted from tmux-toolkit $(cat lib/VERSION)" >&2
+            echo "  expected $want" >&2
+            echo "  actual   $have" >&2
+            exit 1
+          fi
+          echo "lib/ matches tmux-toolkit $(cat lib/VERSION)"
       - name: bats
         run: bats tests/resumer.bats

@@ -21,6 +21,11 @@ set -euo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPTS_DIR/helpers.sh"
+# toolkit-ui, not toolkit: this script is both the hook entry point and the menu
+# entry point, and the menu path needs lock.sh. helpers.sh already sourced the hot
+# set, so this adds lock, menu and notify only.
+# shellcheck source=../lib/toolkit-ui.sh
+source "$AGENT_RESUMER_PLUGIN_DIR/lib/toolkit-ui.sh"
 
 RESUMER_DIR="${RESUMER_DIR:-$HOME/.tmux-agent-resumer}"
 DB="${DB:-$RESUMER_DIR/resumer.db}"
@@ -32,31 +37,32 @@ KEYCHAIN_SERVICE="${KEYCHAIN_SERVICE:-Claude Code-credentials}"
 USAGE_URL="${USAGE_URL:-https://api.anthropic.com/api/oauth/usage}"
 TRACKER_DB="${TRACKER_DB:-$HOME/.tmux-agent-tracker/tracker.db}"
 
-sql() { printf '.timeout 100\n%s\n' "$*" | sqlite3 "$DB"; }
-sql_esc() { local q="'"; printf '%s' "${1//$q/$q$q}"; }
+# TK_DIR is resolved here rather than deferred to load_config the way helpers.sh
+# has to: RESUMER_DIR is known by this point, and tk_lock and tk_log both key off
+# TK_DIR, so they must not wait for the first config load to find their paths.
+_resumer_tk_init
 
-# Atomic mkdir lock (macOS has no flock). Returns 0 if acquired. Steals a lock
-# older than 120s so a killed holder can't deadlock. _unlock releases it.
-_try_lock() {
-    local d="$RESUMER_DIR/.lock.$1"
-    mkdir -p "$RESUMER_DIR" 2>/dev/null || true
-    if mkdir "$d" 2>/dev/null; then return 0; fi
-    local age; age=$(( $(date +%s) - $(_file_mtime "$d" 2>/dev/null || echo 0) ))
-    if [[ "$age" -ge 120 ]]; then rmdir "$d" 2>/dev/null || true; mkdir "$d" 2>/dev/null && return 0; fi
-    return 1
-}
-_unlock() { rmdir "$RESUMER_DIR/.lock.$1" 2>/dev/null || true; }
+sql() { tk_sql "$DB" "$@"; }
+sql_esc() { tk_sql_esc "$1"; }
 
+# The mkdir lock moved to lib/lock.sh, which writes the holder's pid into the
+# directory and steals as soon as that pid is gone. The version here waited a flat
+# 120s, so a killed holder blocked the credit guard and the caffeinate hold for two
+# minutes. A pre-existing lock dir has no pid file; tk_lock falls back to age for
+# those, so locks held across this upgrade still clear.
+_try_lock() { tk_lock "$1"; }
+_unlock() { tk_unlock "$1"; }
+
+# tk_log's target is $TK_DIR/debug.log, which is the same path this wrote to.
+# Two differences, neither of which anything parses: the line gains a `[debug]`
+# level field, and the trim is sampled at ~1 write in 100 instead of running
+# `wc -l` on the log for every single line.
+# The level is passed as a command prefix rather than a `local`, so the linter can
+# see it is used. Measured on bash 3.2: the function sees the assignment and it does
+# not persist afterwards, even though POSIX permits a shell to keep it.
 _debug_log() {
     [[ "${DEBUG_LOG:-1}" == "1" ]] || return 0
-    mkdir -p "$RESUMER_DIR"
-    local _log="$RESUMER_DIR/debug.log"
-    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$_log"
-    local _lc
-    _lc=$(wc -l < "$_log" 2>/dev/null) || return 0
-    if [[ "${_lc:-0}" -gt 1500 ]]; then
-        tail -n 1000 "$_log" > "$_log.tmp" && mv -f "$_log.tmp" "$_log"
-    fi
+    TK_LOG_LEVEL=debug tk_log debug "$*"
 }
 
 # Phone push via ntfy.sh. No-op unless @agent-resumer-ntfy-topic is set. #3.
@@ -67,6 +73,16 @@ _notify() {
 }
 
 # Flat "key":"value" extraction (no jq at runtime). Same as tracker's _json_val.
+#
+# NOT replaced by lib/json.sh's tk_json, and this is the reason: two of the three
+# call sites here look up a key that is *nested*, not top-level. `_json_val "$line"
+# text` on an assistant record digs out .message.content[0].text purely because a
+# substring slice does not care about depth. tk_json is jq-first and evaluates
+# `.text`, which is null on that record, so a drop-in swap would silently make
+# _classify_limit see an empty string and report every 429 as "unknown".
+# Untangling that means deciding per call site whether the key is top-level
+# (session_id, transcript_path) or a dig (text), which is a behaviour change, not
+# an extraction.
 _json_val() {
     local _t="${1#*\"$2\":\"}"
     [[ "$_t" == "$1" ]] && return

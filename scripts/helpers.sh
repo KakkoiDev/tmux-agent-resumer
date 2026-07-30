@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# helpers.sh - Config loading and tmux/process helpers for tmux-agent-resumer.
-# Lifted from tmux-agent-tracker/scripts/helpers.sh; option namespace is
-# @agent-resumer-* so it coexists with the tracker.
+# helpers.sh - a shim over the vendored tmux-toolkit.
+#
+# This file was lifted wholesale from tmux-agent-tracker/scripts/helpers.sh, so
+# _file_mtime, get_tmux_option and check_tmux_version here were byte-identical to
+# the tracker's and to mesh's, and load_config was the same cache architecture
+# written a fourth time. They now delegate to lib/, so a fix lands once.
+#
+# The old names are kept: resumer.sh and agent-resumer.tmux call them at ~90
+# sites, and renaming those is a separate change from extracting them. Every
+# signature and return value is unchanged.
 
 if [[ -z "${AGENT_RESUMER_PLUGIN_DIR:-}" ]]; then
     AGENT_RESUMER_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,14 +16,17 @@ fi
 # shellcheck disable=SC2034  # used by callers that source this file
 SCRIPTS_DIR="$AGENT_RESUMER_PLUGIN_DIR/scripts"
 
+# shellcheck source=../lib/toolkit.sh
+source "$AGENT_RESUMER_PLUGIN_DIR/lib/toolkit.sh"
+tk_require_version 0.2.0
+
+# tk_init is deferred to load_config: resumer.sh sources this file before it
+# resolves RESUMER_DIR, so the data dir is not knowable yet at source time.
+_resumer_tk_init() { tk_init agent-resumer "${RESUMER_DIR:-$HOME/.tmux-agent-resumer}"; }
+
 # ── platform helpers ──────────────────────────────────────────────────
 
-_file_mtime() {
-    case "$(uname)" in
-        Darwin) stat -f %m "$1" ;;
-        *)      stat -c %Y "$1" ;;
-    esac
-}
+_file_mtime() { tk_mtime "$1"; }
 
 # Does shell $1 still have a live agent child? Same detection the tracker
 # uses; a resume target is pointless if the agent process is gone.
@@ -76,149 +86,82 @@ _has_agent_child() {
 
 # ── tmux option helpers ──────────────────────────────────────────────
 
-get_tmux_option() {
-    local option="$1" default="${2:-}"
-    local value
-    value=$(tmux show-option -gqv "$option" 2>/dev/null) || true
-    printf '%s' "${value:-$default}"
-}
+get_tmux_option() { tk_opt "$1" "${2:-}"; }
 
 # ── config ────────────────────────────────────────────────────────────
 
-ENABLED=""
-COLOR=""
-ICON_WAITING=""
-ICON_GAVEUP=""
-USAGE_BACKOFF_FLOOR=""
-SPEND_BACKOFF_FLOOR=""
-BACKOFF_CAP=""
-USAGE_RETRY_CAP=""
-SPEND_RETRY_CAP=""
-RESUME_PROMPT=""
-WARN_SESSION=""
-WARN_WEEKLY=""
-WARN_CREDITS=""
-IDLE_GRACE=""
-CAFFEINATE=""
-NTFY_TOPIC=""
-ALLOW_CREDITS=""
-CREDIT_THRESHOLD=""
-INTERRUPT_ESCAPES=""
-CREDIT_NOTICE=""
-RESUME_JITTER=""
-INTERRUPT_PAUSE=""
-GUARD_COOLDOWN=""
-VIM_MODE=""
-DEBUG_LOG=""
+# Declared so resumer.sh and agent-resumer.tmux can read them under `set -u`
+# before load_config has run. One `declare` rather than 25 assignments, so a
+# single SC2034 directive covers all of them: the writes are invisible to the
+# linter because tk_config_load assigns through tk_opt_into, which has to be an
+# eval since bash 3.2 has no namerefs.
+# shellcheck disable=SC2034
+declare ENABLED="" COLOR="" ICON_WAITING="" ICON_GAVEUP="" \
+        USAGE_BACKOFF_FLOOR="" SPEND_BACKOFF_FLOOR="" BACKOFF_CAP="" \
+        USAGE_RETRY_CAP="" SPEND_RETRY_CAP="" RESUME_PROMPT="" \
+        WARN_SESSION="" WARN_WEEKLY="" WARN_CREDITS="" IDLE_GRACE="" \
+        CAFFEINATE="" NTFY_TOPIC="" ALLOW_CREDITS="" CREDIT_THRESHOLD="" \
+        INTERRUPT_ESCAPES="" CREDIT_NOTICE="" RESUME_JITTER="" \
+        INTERRUPT_PAUSE="" GUARD_COOLDOWN="" VIM_MODE="" DEBUG_LOG=""
 
-load_config() {
-    local cache="${RESUMER_DIR:-$HOME/.tmux-agent-resumer}/config_cache"
-    if [[ -f "$cache" ]]; then
-        local age now
-        now=$(date +%s)
-        age=$(( now - $(_file_mtime "$cache" 2>/dev/null || echo 0) ))
-        if [[ "$age" -lt 60 ]]; then
-            # shellcheck disable=SC1090  # runtime-generated cache path
-            source "$cache"
-            return
-        fi
-    fi
-
-    # Master kill switch. Default OFF: nothing types into a pane until the
-    # user opts in after the reproduction gate is satisfied.
-    ENABLED=$(get_tmux_option "@agent-resumer-enabled" "off")
-    COLOR=$(get_tmux_option "@agent-resumer-color" "yellow")
-    ICON_WAITING=$(get_tmux_option "@agent-resumer-icon-waiting" "~")
-    ICON_GAVEUP=$(get_tmux_option "@agent-resumer-icon-gaveup" "x")
-    USAGE_BACKOFF_FLOOR=$(get_tmux_option "@agent-resumer-usage-backoff-floor" "120")
-    SPEND_BACKOFF_FLOOR=$(get_tmux_option "@agent-resumer-spend-backoff-floor" "1800")
-    BACKOFF_CAP=$(get_tmux_option "@agent-resumer-backoff-cap" "3600")
-    USAGE_RETRY_CAP=$(get_tmux_option "@agent-resumer-usage-retry-cap" "12")
-    SPEND_RETRY_CAP=$(get_tmux_option "@agent-resumer-spend-retry-cap" "48")
-    RESUME_PROMPT=$(get_tmux_option "@agent-resumer-resume-prompt" "resume")
+# A spec is VARNAME:@option:default. The comments that used to sit above each
+# get_tmux_option call are kept, because they document policy rather than syntax.
+_RESUMER_CONFIG_SPECS=(
+    # Master kill switch. Default OFF: nothing types into a pane until the user
+    # opts in after the reproduction gate is satisfied.
+    'ENABLED:@agent-resumer-enabled:off'
+    'COLOR:@agent-resumer-color:yellow'
+    'ICON_WAITING:@agent-resumer-icon-waiting:~'
+    'ICON_GAVEUP:@agent-resumer-icon-gaveup:x'
+    'USAGE_BACKOFF_FLOOR:@agent-resumer-usage-backoff-floor:120'
+    'SPEND_BACKOFF_FLOOR:@agent-resumer-spend-backoff-floor:1800'
+    'BACKOFF_CAP:@agent-resumer-backoff-cap:3600'
+    'USAGE_RETRY_CAP:@agent-resumer-usage-retry-cap:12'
+    'SPEND_RETRY_CAP:@agent-resumer-spend-retry-cap:48'
+    'RESUME_PROMPT:@agent-resumer-resume-prompt:resume'
     # Spill-alert thresholds (percent). Crossing = next tokens hit paid overage.
-    WARN_SESSION=$(get_tmux_option "@agent-resumer-warn-session" "90")
-    WARN_WEEKLY=$(get_tmux_option "@agent-resumer-warn-weekly" "90")
-    WARN_CREDITS=$(get_tmux_option "@agent-resumer-warn-credits" "80")
+    'WARN_SESSION:@agent-resumer-warn-session:90'
+    'WARN_WEEKLY:@agent-resumer-warn-weekly:90'
+    'WARN_CREDITS:@agent-resumer-warn-credits:80'
     # Resume a focused pane anyway if its client has been idle this long (walked away).
-    IDLE_GRACE=$(get_tmux_option "@agent-resumer-idle-grace" "60")
+    'IDLE_GRACE:@agent-resumer-idle-grace:60'
     # Hold a caffeinate (block idle sleep) while any agent is paused, so the resume
     # timer survives lunch. Does not beat closing the lid.
-    CAFFEINATE=$(get_tmux_option "@agent-resumer-caffeinate" "on")
+    'CAFFEINATE:@agent-resumer-caffeinate:on'
     # ntfy.sh topic for phone push on limit-hit / resume / give-up. Empty = off.
-    NTFY_TOPIC=$(get_tmux_option "@agent-resumer-ntfy-topic" "")
+    'NTFY_TOPIC:@agent-resumer-ntfy-topic:'
     # Credit safety: off (default) = block paid usage-credit spend. When the session
     # window crosses CREDIT_THRESHOLD%, interrupt agents so they don't spend, wait for
     # reset, resume. on = allow credits (emergency company extra usage).
-    ALLOW_CREDITS=$(get_tmux_option "@agent-resumer-allow-credits" "off")
-    CREDIT_THRESHOLD=$(get_tmux_option "@agent-resumer-credit-threshold" "100")
+    'ALLOW_CREDITS:@agent-resumer-allow-credits:off'
+    'CREDIT_THRESHOLD:@agent-resumer-credit-threshold:100'
     # How many Escapes to send to interrupt a turn (1 = plain interrupt; >1 risks
     # opening Claude's rewind menu - verify on a live pane before raising).
-    INTERRUPT_ESCAPES=$(get_tmux_option "@agent-resumer-interrupt-escapes" "3")
+    'INTERRUPT_ESCAPES:@agent-resumer-interrupt-escapes:3'
     # Notice typed into the paused pane's input box (not submitted).
-    CREDIT_NOTICE=$(get_tmux_option "@agent-resumer-credit-notice" "[Credit usage disabled - enable in resumer options]")
+    'CREDIT_NOTICE:@agent-resumer-credit-notice:[Credit usage disabled - enable in resumer options]'
     # Seconds of random jitter added to each scheduled retry so a global reset does
     # not release every paused agent simultaneously.
-    RESUME_JITTER=$(get_tmux_option "@agent-resumer-resume-jitter" "30")
+    'RESUME_JITTER:@agent-resumer-resume-jitter:30'
     # Seconds to wait after an interrupt Escape before typing, so the Escape lands
     # as a standalone interrupt instead of merging with the next key into a sequence.
-    INTERRUPT_PAUSE=$(get_tmux_option "@agent-resumer-interrupt-pause" "1")
+    'INTERRUPT_PAUSE:@agent-resumer-interrupt-pause:1'
     # Min seconds between credit-guard actions on the same session - stops the notice
     # being re-typed every scan while an agent stays busy; still re-blocks after this.
-    GUARD_COOLDOWN=$(get_tmux_option "@agent-resumer-guard-cooldown" "90")
+    'GUARD_COOLDOWN:@agent-resumer-guard-cooldown:90'
     # Claude Code vim-mode input: auto (detect from pane), on, or off. In vim mode
     # text must be typed in insert state or it is eaten as normal-mode commands.
-    VIM_MODE=$(get_tmux_option "@agent-resumer-vim-mode" "auto")
-    DEBUG_LOG=$(get_tmux_option "@agent-resumer-debug-log" "1")
+    'VIM_MODE:@agent-resumer-vim-mode:auto'
+    'DEBUG_LOG:@agent-resumer-debug-log:1'
+)
 
-    cat > "${cache}.tmp" <<EOF
-ENABLED='$ENABLED'
-COLOR='$COLOR'
-ICON_WAITING='$ICON_WAITING'
-ICON_GAVEUP='$ICON_GAVEUP'
-USAGE_BACKOFF_FLOOR='$USAGE_BACKOFF_FLOOR'
-SPEND_BACKOFF_FLOOR='$SPEND_BACKOFF_FLOOR'
-BACKOFF_CAP='$BACKOFF_CAP'
-USAGE_RETRY_CAP='$USAGE_RETRY_CAP'
-SPEND_RETRY_CAP='$SPEND_RETRY_CAP'
-RESUME_PROMPT='$RESUME_PROMPT'
-WARN_SESSION='$WARN_SESSION'
-WARN_WEEKLY='$WARN_WEEKLY'
-WARN_CREDITS='$WARN_CREDITS'
-IDLE_GRACE='$IDLE_GRACE'
-CAFFEINATE='$CAFFEINATE'
-NTFY_TOPIC='$NTFY_TOPIC'
-ALLOW_CREDITS='$ALLOW_CREDITS'
-CREDIT_THRESHOLD='$CREDIT_THRESHOLD'
-INTERRUPT_ESCAPES='$INTERRUPT_ESCAPES'
-CREDIT_NOTICE='$CREDIT_NOTICE'
-RESUME_JITTER='$RESUME_JITTER'
-INTERRUPT_PAUSE='$INTERRUPT_PAUSE'
-GUARD_COOLDOWN='$GUARD_COOLDOWN'
-VIM_MODE='$VIM_MODE'
-DEBUG_LOG='$DEBUG_LOG'
-EOF
-    mv -f "${cache}.tmp" "$cache"
+load_config() {
+    _resumer_tk_init
+    tk_config_load agent-resumer 60 "${_RESUMER_CONFIG_SPECS[@]}"
 }
 
-check_tmux_version() {
-    local required="${1:-3.0}"
-    local current
-    current=$(tmux -V 2>/dev/null | sed 's/[^0-9.]//g') || return 1
-    [[ -z "$current" ]] && return 1
-    local cur_major cur_minor req_major req_minor
-    cur_major="${current%%.*}"
-    cur_minor="${current#*.}"; cur_minor="${cur_minor%%.*}"
-    req_major="${required%%.*}"
-    req_minor="${required#*.}"; req_minor="${req_minor%%.*}"
-    if [[ "$cur_major" -gt "$req_major" ]]; then return 0; fi
-    if [[ "$cur_major" -eq "$req_major" && "$cur_minor" -ge "$req_minor" ]]; then return 0; fi
-    return 1
-}
+# ── version check ────────────────────────────────────────────────────
 
-ensure_tmux_version() {
-    if ! check_tmux_version "3.0"; then
-        echo "tmux-agent-resumer requires tmux 3.0+" >&2
-        return 1
-    fi
-}
+check_tmux_version() { tk_vers_ge "${1:-3.0}"; }
+
+ensure_tmux_version() { tk_vers_require 3.0 tmux-agent-resumer; }
