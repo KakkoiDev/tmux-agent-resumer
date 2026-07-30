@@ -1,4 +1,6 @@
 #!/usr/bin/env bats
+
+load assert
 # Unit tests for the safe (non-intrusive) parts of tmux-agent-resumer:
 # limit classification, backoff math, and the detect-file analyzer.
 # The resume/send-keys path is intentionally NOT tested here - it is held
@@ -65,12 +67,12 @@ teardown() {
 
 @test "detect-file: spend transcript" {
     run bash "$SCRIPT" detect-file "$TMPD/spend.jsonl"
-    [[ "$output" == spend$'\t'* ]]
+    assert_match "$output" spend$'\t'*
 }
 
 @test "detect-file: usage transcript" {
     run bash "$SCRIPT" detect-file "$TMPD/usage.jsonl"
-    [[ "$output" == usage$'\t'* ]]
+    assert_match "$output" usage$'\t'*
 }
 
 @test "detect-file: 500 server error is NOT a limit" {
@@ -99,11 +101,11 @@ teardown() {
     WARN_SESSION=90 WARN_WEEKLY=90 WARN_CREDITS=80
     printf '%s' '{"five_hour":{"utilization":93},"seven_day":{"utilization":40},"spend":{"enabled":true,"percent":85}}' > "$TMPD/hot.json"
     run _usage_warn "$TMPD/hot.json"
-    [[ "$output" == *"LIMIT"* ]]         # session over -> plan-limit segment
-    [[ "$output" == *"S93"* ]]
-    [[ "$output" == *"CREDITS"* ]]       # credits over -> credit segment
-    [[ "$output" == *"C85"* ]]
-    [[ "$output" != *"W40"* ]]           # weekly 40% under threshold
+    assert_contains "$output" "LIMIT" # session over -> plan-limit segment
+    assert_contains "$output" "S93"
+    assert_contains "$output" "CREDITS" # credits over -> credit segment
+    assert_contains "$output" "C85"
+    refute_contains "$output" "W40" # weekly 40% under threshold
 }
 
 @test "warn badge: silent below thresholds (your live numbers)" {
