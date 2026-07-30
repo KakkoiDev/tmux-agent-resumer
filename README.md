@@ -1,5 +1,10 @@
 # tmux-agent-resumer
 
+> `lib/` is vendored from [tmux-toolkit](https://github.com/KakkoiDev/tmux-toolkit)
+> via `git subtree`; do not edit it in place, CI fails on drift. If you are an agent
+> picking up in-flight work on this plugin, start at
+> [tmux-toolkit `docs/RESUME.md`](https://github.com/KakkoiDev/tmux-toolkit/blob/main/docs/RESUME.md).
+
 Monitor Claude Code usage from tmux, warn before you spill into paid overage, and
 auto-resume agents that stalled on a rate limit once their window resets. Sibling to
 [tmux-agent-tracker](../tmux-agent-tracker). Pure bash + SQLite, hook-driven, no daemon.
